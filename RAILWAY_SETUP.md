@@ -19,13 +19,26 @@ This keeps:
 ### 2 — PostgreSQL (recommended for production)
 
 1. Add **PostgreSQL** service in the same Railway project
-2. **Rinse-RiseBilling** → **Variables** → delete any old manual `DATABASE_URL`
-3. **+ New Variable** → **Variable Reference**
-   - Service: **PostgreSQL**
-   - Variable: **`DATABASE_PRIVATE_URL`**
-   - Name: **`DATABASE_URL`**
-4. Add second reference: **PostgreSQL** → **`DATABASE_PUBLIC_URL`**
-5. **Redeploy**
+2. **Rinse-RiseBilling** → **Variables** → **delete any old** `DATABASE_URL` (especially if it contains `postgres.railway.internal`)
+3. Add these variables (pick **one** approach):
+
+**Option A — Variable references (recommended)**
+
+| Name | Value |
+|------|--------|
+| `DATABASE_URL` | Reference → Postgres → `DATABASE_PRIVATE_URL` |
+| `DATABASE_PUBLIC_URL` | Reference → Postgres → `DATABASE_PUBLIC_URL` |
+
+**Option B — Public URL only (if internal DNS fails)**
+
+| Name | Value |
+|------|--------|
+| `DATABASE_URL` | Paste **DATABASE_PUBLIC_URL** from Postgres (host like `*.proxy.rlwy.net`) |
+| `DATABASE_PUBLIC_URL` | Same public URL (optional fallback) |
+
+The app **prefers `DATABASE_PUBLIC_URL`** when both are set. Never commit real passwords to git — set them only in Railway Variables.
+
+4. **Redeploy**
 
 With Postgres linked, all bills persist in the cloud database (even without the volume). The volume still helps for WhatsApp session files.
 
