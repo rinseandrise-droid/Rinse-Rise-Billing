@@ -44,8 +44,9 @@ With Postgres linked, all bills persist in the cloud database (even without the 
 
 ### 3 — Memory for WhatsApp
 
-- Service **RAM:** at least **1 GB**
+- Service **RAM:** at least **1 GB** (2 GB is better for faster QR)
 - Variable `WHATSAPP_ENABLED=1` (default in Docker image)
+- The container runs a small **health proxy** on port 3001 so the billing page shows scanner progress immediately; the real scanner runs on port 3002 inside the same container
 
 ## Verify after deploy
 

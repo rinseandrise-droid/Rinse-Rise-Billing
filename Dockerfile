@@ -6,6 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     WHATSAPP_BRIDGE_URL=http://127.0.0.1:3001 \
     WHATSAPP_BRIDGE_PORT=3001 \
+    WHATSAPP_BRIDGE_INTERNAL_PORT=3002 \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     DATA_DIR=/app/data \
     WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth \
     WHATSAPP_CACHE_DIR=/app/data/whatsapp-cache \
@@ -50,6 +53,7 @@ RUN apt-get update \
         libxext6 \
         libxi6 \
         libxtst6 \
+        chromium \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -57,8 +61,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 COPY whatsapp-bridge/package.json whatsapp-bridge/package-lock.json ./whatsapp-bridge/
 RUN cd whatsapp-bridge && npm ci --omit=dev --ignore-scripts \
-    && npx puppeteer browsers install chrome \
-    && node -e "const p=require('puppeteer'); const fs=require('fs'); const e=p.executablePath(); if(!fs.existsSync(e)) { console.error('Chrome missing:', e); process.exit(1); } console.log('Chrome OK:', e);"
+    && node -e "const fs=require('fs'); const c='/usr/bin/chromium'; if(!fs.existsSync(c)) { console.error('Chromium missing:', c); process.exit(1); } console.log('Chromium OK:', c);"
 
 COPY whatsapp-bridge/patch-wwebjs.js ./whatsapp-bridge/
 RUN cd whatsapp-bridge && node patch-wwebjs.js

@@ -2,7 +2,8 @@
 set -e
 
 PORT="${PORT:-8080}"
-BRIDGE_PORT="${WHATSAPP_BRIDGE_PORT:-3001}"
+BRIDGE_PUBLIC="${WHATSAPP_BRIDGE_PORT:-3001}"
+BRIDGE_INTERNAL="${WHATSAPP_BRIDGE_INTERNAL_PORT:-3002}"
 DATA="${DATA_DIR:-/app/data}"
 WA_AUTH="${WHATSAPP_AUTH_DIR:-$DATA/whatsapp-auth}"
 WA_CACHE="${WHATSAPP_CACHE_DIR:-$DATA/whatsapp-cache}"
@@ -25,11 +26,33 @@ export RAILWAY_ENVIRONMENT="${RAILWAY_ENVIRONMENT:-1}"
 export WHATSAPP_CLIENT_ID="${WHATSAPP_CLIENT_ID:-rinse-rise}"
 export WHATSAPP_AUTH_DIR="$WA_AUTH"
 export WHATSAPP_CACHE_DIR="$WA_CACHE"
-export WHATSAPP_BRIDGE_PORT="$BRIDGE_PORT"
+export WHATSAPP_BRIDGE_PORT="$BRIDGE_PUBLIC"
+export WHATSAPP_BRIDGE_INTERNAL_PORT="$BRIDGE_INTERNAL"
+export WHATSAPP_BRIDGE_URL="http://127.0.0.1:${BRIDGE_PUBLIC}"
 export DATA_DIR="$DATA"
+export PUPPETEER_EXECUTABLE_PATH="${PUPPETEER_EXECUTABLE_PATH:-/usr/bin/chromium}"
 
-bridge_healthy() {
-  curl -fsS "http://127.0.0.1:${BRIDGE_PORT}/health" >/dev/null 2>&1
+bridge_internal_healthy() {
+  curl -fsS "http://127.0.0.1:${BRIDGE_INTERNAL}/health" >/dev/null 2>&1
+}
+
+bridge_public_healthy() {
+  curl -fsS "http://127.0.0.1:${BRIDGE_PUBLIC}/health" >/dev/null 2>&1
+}
+
+start_proxy_background() {
+  if [ "${WHATSAPP_ENABLED:-1}" = "0" ]; then
+    return 0
+  fi
+  echo "Starting WhatsApp health proxy on port ${BRIDGE_PUBLIC}..."
+  (
+    cd /app/whatsapp-bridge
+    while true; do
+      node proxy.js >> "$DATA/whatsapp-proxy.log" 2>&1
+      echo "WhatsApp proxy exited — restarting in 3s..."
+      sleep 3
+    done
+  ) &
 }
 
 start_bridge_background() {
@@ -48,7 +71,7 @@ start_bridge_background() {
         sleep 2
       fi
 
-      if bridge_healthy; then
+      if bridge_internal_healthy; then
         sleep 15
         continue
       fi
@@ -61,8 +84,8 @@ start_bridge_background() {
         rm -f "$WA_AUTH/.bridge.lock"
       fi
 
-      echo "Starting WhatsApp bridge (auth: $WA_AUTH)..."
-      node server.js >> "$DATA/whatsapp-bridge.log" 2>&1
+      echo "Starting WhatsApp bridge on port ${BRIDGE_INTERNAL} (auth: $WA_AUTH)..."
+      WHATSAPP_BRIDGE_PORT="$BRIDGE_INTERNAL" node server.js >> "$DATA/whatsapp-bridge.log" 2>&1
       echo "WhatsApp bridge exited — restarting in ${backoff}s..."
       sleep "$backoff"
       if [ "$backoff" -lt 60 ]; then
@@ -72,14 +95,15 @@ start_bridge_background() {
   ) &
 }
 
+start_proxy_background
 start_bridge_background
 
 if [ "${WHATSAPP_ENABLED:-1}" != "0" ]; then
-  echo "WhatsApp bridge starting in background (web app starts immediately)..."
+  echo "WhatsApp proxy + bridge starting in background..."
   waited=0
-  while [ "$waited" -lt 45 ]; do
-    if bridge_healthy; then
-      echo "WhatsApp bridge is up."
+  while [ "$waited" -lt 20 ]; do
+    if bridge_public_healthy; then
+      echo "WhatsApp proxy is up (scanner may still be loading)."
       break
     fi
     sleep 1

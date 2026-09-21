@@ -3211,11 +3211,13 @@ function renderWhatsAppConnectBody(status = null) {
     const restoring = isWhatsAppSessionRestoring(status);
     if (hosted && (status?.phase === "starting" || status?.phase === "booting") && !status?.ready) {
       const elapsed = status.startupSeconds || 0;
-      const pct = Math.min(90, 20 + elapsed * 2);
+      const pct = Math.min(90, 15 + elapsed * 3);
       const stuckHint =
-        elapsed >= 25
+        elapsed >= 40
           ? "Scanner is taking longer than usual. Click <strong>Reset Connection</strong> below to force a fresh QR code."
-          : "QR code will appear here in about <strong>15–30 seconds</strong>. Keep this window open.";
+          : elapsed >= 15
+            ? "Chrome is loading on the server — QR usually appears within <strong>30–60 seconds</strong>. Keep this window open."
+            : "Starting scanner on the server — QR will appear here shortly. Keep this window open.";
       body.innerHTML = `
         <p class="wa-connect-msg">Starting WhatsApp scanner${elapsed ? ` (${elapsed}s)` : ""}…</p>
         <div class="wa-connect-progress"><div class="wa-connect-progress-bar" style="width:${pct}%"></div></div>

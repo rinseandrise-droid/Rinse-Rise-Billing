@@ -43,8 +43,8 @@ const AUTH_READY_TIMEOUT_MS = Number(
 );
 const RESTORE_QR_GRACE_MS = Number(process.env.WHATSAPP_RESTORE_GRACE_MS || (IS_HOSTED ? 0 : 60000));
 const RESTORE_FAIL_MS = Number(process.env.WHATSAPP_RESTORE_FAIL_MS || (IS_HOSTED ? 12000 : 150000));
-const QR_STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS || (IS_HOSTED ? 25000 : 120000));
-const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 40000 : 90000));
+const QR_STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS || (IS_HOSTED ? 45000 : 120000));
+const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 90000 : 90000));
 const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "rinse-rise";
 
 const state = {
@@ -238,16 +238,9 @@ function releaseSingleInstanceLock() {
   }
 }
 
-/** Hosted: Puppeteer bundled Chrome (most reliable). Local Windows: system Chrome/Edge. */
+/** Hosted: system Chromium (fastest on Docker). Local Windows: system Chrome/Edge. */
 function resolveChromePath() {
   if (IS_HOSTED) {
-    try {
-      const puppeteer = require("puppeteer");
-      const bundled = puppeteer.executablePath();
-      if (bundled && fs.existsSync(bundled)) return bundled;
-    } catch (err) {
-      console.warn("[WhatsApp] Puppeteer bundled Chrome lookup:", err.message);
-    }
     const candidates = [
       process.env.PUPPETEER_EXECUTABLE_PATH,
       "/usr/bin/chromium",
@@ -260,6 +253,13 @@ function resolveChromePath() {
       } catch {
         /* ignore */
       }
+    }
+    try {
+      const puppeteer = require("puppeteer");
+      const bundled = puppeteer.executablePath();
+      if (bundled && fs.existsSync(bundled)) return bundled;
+    } catch (err) {
+      console.warn("[WhatsApp] Puppeteer bundled Chrome lookup:", err.message);
     }
     return "";
   }
@@ -639,6 +639,7 @@ function createClient() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
+      "--no-zygote",
       "--mute-audio",
       "--disable-extensions",
       "--disable-background-networking",
@@ -647,8 +648,13 @@ function createClient() {
       "--disable-ipc-flooding-protection",
       "--disable-renderer-backgrounding",
       "--disable-background-timer-throttling",
+      "--disable-software-rasterizer",
+      "--window-size=1280,720",
     ],
   };
+  if (IS_HOSTED) {
+    puppeteerConfig.args.push("--single-process");
+  }
   const chromePath = getChromePath();
   if (chromePath) {
     puppeteerConfig.executablePath = chromePath;
@@ -859,8 +865,17 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
     wipeAuthDir();
   } else if (IS_HOSTED && hasSessionLinked()) {
     const sessionDir = sessionDirPath();
-    if (!fs.existsSync(sessionDir)) {
-      console.warn("[WhatsApp] Session marker without data — clearing for fresh QR.");
+    let sessionUsable = fs.existsSync(sessionDir);
+    if (sessionUsable) {
+      try {
+        const entries = fs.readdirSync(sessionDir).filter((name) => !name.startsWith("."));
+        sessionUsable = entries.length > 0;
+      } catch {
+        sessionUsable = false;
+      }
+    }
+    if (!sessionUsable) {
+      console.warn("[WhatsApp] Saved session missing or empty — clearing for fresh QR.");
       wipeAuthDir();
     }
   }
@@ -881,13 +896,11 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
   state.sessionLinked = linked;
   state.qr = null;
   state.qrGeneration = 0;
-  if (linked) {
-    console.log(
-      IS_HOSTED
-        ? "[WhatsApp] Checking saved session on server…"
-        : "[WhatsApp] Restoring saved session from disk…"
-    );
+  if (linked && !IS_HOSTED) {
+    console.log("[WhatsApp] Restoring saved WhatsApp session from disk…");
     scheduleRestoreWatchdog();
+  } else if (linked && IS_HOSTED) {
+    console.log("[WhatsApp] Checking saved session on server (QR appears if link expired)…");
   }
   scheduleQrStartupWatchdog();
   try {
