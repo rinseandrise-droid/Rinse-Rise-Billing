@@ -5,8 +5,21 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
-const QRCode = require("qrcode");
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+
+/** Lazy-load heavy deps so /health responds within seconds on Railway. */
+let Client = null;
+let LocalAuth = null;
+let MessageMedia = null;
+let QRCode = null;
+let wwebjsLoaded = false;
+
+function ensureWwebjs() {
+  if (wwebjsLoaded) return;
+  ({ Client, LocalAuth, MessageMedia } = require("whatsapp-web.js"));
+  QRCode = require("qrcode");
+  wwebjsLoaded = true;
+  console.log("[WhatsApp] Libraries loaded.");
+}
 
 const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT || 3001);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
@@ -38,7 +51,7 @@ const state = {
   ready: false,
   qr: null,
   lastError: null,
-  phase: "starting",
+  phase: "booting",
   loadingPercent: 0,
   authenticatingSince: null,
   waState: null,
@@ -124,6 +137,9 @@ function scheduleRestoreWatchdog() {
 async function forceFreshQrLink(reason) {
   if (freshQrInFlight) return;
   freshQrInFlight = true;
+  if (IS_HOSTED && reason === "qr-startup-timeout") {
+    process.env.WHATSAPP_REMOTE_CACHE = "1";
+  }
   clearRestoreWatchdog();
   clearQrStartupWatchdog();
   clearSessionLinked();
@@ -613,6 +629,8 @@ function validateHostedChrome() {
 }
 
 function createClient() {
+  ensureWwebjs();
+  const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE === "1");
   const puppeteerConfig = {
     headless: true,
     args: [
@@ -643,12 +661,20 @@ function createClient() {
     takeoverTimeoutMs: 0,
   };
 
-  // Always pin bundled WA Web HTML — remote fetch often fails or delays QR on Railway.
-  clientOptions.webVersion = WA_WEB_VERSION;
-  clientOptions.webVersionCache = {
-    type: "local",
-    path: CACHE_DIR,
-  };
+  if (useRemoteCache) {
+    clientOptions.webVersionCache = {
+      type: "remote",
+      remotePath:
+        "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html",
+    };
+    console.log("[WhatsApp] Using remote WA Web cache fallback.");
+  } else {
+    clientOptions.webVersion = WA_WEB_VERSION;
+    clientOptions.webVersionCache = {
+      type: "local",
+      path: CACHE_DIR,
+    };
+  }
 
   return new Client(clientOptions);
 }
@@ -808,8 +834,22 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
   initInProgress = true;
   bridgeStartedAt = Date.now();
   qrDuringRestoreCount = 0;
+  state.phase = "starting";
+  state.lastError = "Loading WhatsApp libraries…";
+  // Yield so /health and /status respond before heavy synchronous requires block the event loop.
+  await sleep(250);
+  try {
+    ensureWwebjs();
+  } catch (err) {
+    state.phase = "error";
+    state.lastError = `Scanner libraries failed to load: ${err.message}`;
+    initInProgress = false;
+    throw err;
+  }
+  await sleep(0);
   ensureWaWebCache();
   resetChromePathCache();
+  await sleep(0);
   if (!validateHostedChrome()) {
     initInProgress = false;
     return;
@@ -1062,6 +1102,7 @@ async function sendMediaToChat(chatId, media, caption) {
 }
 
 async function performSend(digits, message, filePath, filename) {
+  ensureWwebjs();
   await quickSendCheck();
 
   const media = MessageMedia.fromFilePath(filePath);
@@ -1109,6 +1150,7 @@ async function performSend(digits, message, filePath, filename) {
 }
 
 async function performSendText(digits, message) {
+  ensureWwebjs();
   await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const targets = await resolveSendTargets(digits);
@@ -1143,6 +1185,7 @@ async function performSendText(digits, message) {
 }
 
 async function performSendImage(digits, message, filePath, filename) {
+  ensureWwebjs();
   await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const targets = await resolveSendTargets(digits);
@@ -1186,8 +1229,10 @@ app.get("/health", (_req, res) => {
     ok: true,
     ready: state.ready,
     phase: state.phase,
+    qr: Boolean(state.qr),
     sessionLinked: state.sessionLinked || hasSessionLinked(),
     sendInProgress,
+    startupSeconds: Math.max(0, Math.floor((Date.now() - bridgeStartedAt) / 1000)),
   });
 });
 
@@ -1440,19 +1485,13 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   process.on("exit", releaseSingleInstanceLock);
 
   ensureAuthDirs();
-  console.log(`[WhatsApp] Bridge running on http://127.0.0.1:${PORT}`);
+  state.phase = "booting";
+  console.log(`[WhatsApp] Bridge HTTP ready on http://127.0.0.1:${PORT}`);
   console.log(`[WhatsApp] Session data: ${AUTH_DIR}`);
   console.log(`[WhatsApp] WA Web version: ${WA_WEB_VERSION}`);
   setImmediate(() => {
-    ensureWaWebCache();
     migrateLegacyAuthDir();
     state.sessionLinked = hasSessionLinked();
-    const chromePath = getChromePath();
-    if (chromePath) {
-      console.log(`[WhatsApp] Using browser: ${chromePath}`);
-    } else {
-      console.warn("[WhatsApp] No Chrome found — scanner may fail on this machine.");
-    }
     initializeClient().catch((err) => {
       state.phase = "error";
       state.lastError = err.message;

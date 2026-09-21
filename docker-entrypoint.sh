@@ -20,7 +20,7 @@ fi
 # Stale lock from a previous container must not block startup
 rm -f "$WA_AUTH/.bridge.lock" 2>/dev/null || true
 
-export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=1536}"
+export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=1024}"
 export RAILWAY_ENVIRONMENT="${RAILWAY_ENVIRONMENT:-1}"
 export WHATSAPP_CLIENT_ID="${WHATSAPP_CLIENT_ID:-rinse-rise}"
 export WHATSAPP_AUTH_DIR="$WA_AUTH"
@@ -77,7 +77,7 @@ start_bridge_background
 if [ "${WHATSAPP_ENABLED:-1}" != "0" ]; then
   echo "WhatsApp bridge starting in background (web app starts immediately)..."
   waited=0
-  while [ "$waited" -lt 12 ]; do
+  while [ "$waited" -lt 45 ]; do
     if bridge_healthy; then
       echo "WhatsApp bridge is up."
       break

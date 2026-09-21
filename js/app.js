@@ -3126,8 +3126,9 @@ function renderWhatsAppConnectBody(status = null) {
   if (!bridgeAvailable) {
     lastRenderedWhatsAppQr = null;
     const hostedHint = hosted
-      ? `<p class="wa-connect-hint">The QR scanner runs on this server — keep this window open. QR usually appears within <strong>15–30 seconds</strong>.</p>
-         <p class="wa-connect-hint">If no QR after 1 minute, click <strong>Reset Connection</strong>, wait a few seconds, then scan when QR appears.</p>`
+      ? `<p class="wa-connect-hint">The QR scanner runs on this server — keep this window open. First start can take up to <strong>1 minute</strong> while the scanner boots.</p>
+         <p class="wa-connect-hint">If no QR after 1 minute, click <strong>Reset Connection</strong>, wait 20 seconds, then scan when QR appears.</p>
+         <p class="wa-connect-hint">Railway: set service RAM to at least <strong>1 GB</strong> and mount volume at <strong>/app/data</strong>.</p>`
       : `<ol class="wa-connect-steps">
           <li>Install <strong>Node.js</strong> from <a href="https://nodejs.org" target="_blank" rel="noopener">nodejs.org</a> if not installed</li>
           <li>Close this page and restart <strong>Start Billing.bat</strong></li>
@@ -3202,12 +3203,13 @@ function renderWhatsAppConnectBody(status = null) {
     status?.phase === "connecting" ||
     status?.phase === "restoring" ||
     status?.phase === "reconnecting" ||
+    status?.phase === "booting" ||
     status?.phase === "starting"
   ) {
     lastRenderedWhatsAppQr = null;
     const hosted = isWhatsAppHosted(status);
     const restoring = isWhatsAppSessionRestoring(status);
-    if (hosted && status?.phase === "starting" && !status?.ready) {
+    if (hosted && (status?.phase === "starting" || status?.phase === "booting") && !status?.ready) {
       const elapsed = status.startupSeconds || 0;
       const pct = Math.min(90, 20 + elapsed * 2);
       const stuckHint =

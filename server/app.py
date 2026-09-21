@@ -360,7 +360,7 @@ def api_whatsapp_status():
 def api_whatsapp_start():
     if not whatsapp_enabled():
         return jsonify({"ok": False, "error": "WhatsApp is disabled on this server.", "enabled": False})
-    wait = 20 if is_cloud_deployment() else 10
+    wait = 45 if is_cloud_deployment() else 10
     started = try_start_bridge(wait_seconds=wait)
     status = get_bridge_status()
     return jsonify({"ok": started or status.get("available"), **status})

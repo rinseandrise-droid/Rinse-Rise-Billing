@@ -36,7 +36,8 @@ def whatsapp_enabled() -> bool:
 def bridge_is_running() -> bool:
     try:
         req = urllib.request.Request(f"{BRIDGE_URL}/health", method="GET")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        timeout = 5 if is_cloud_deployment() else 2
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
@@ -142,7 +143,7 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
         }
 
     if auto_start and not bridge_is_running():
-        wait = 45 if hosted else 10
+        wait = 60 if hosted else 10
         try_start_bridge(wait_seconds=wait)
 
     try:
@@ -168,17 +169,19 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
         if bridge_is_running():
             try:
                 health = _bridge_request("/health", timeout=3)
+                phase = health.get("phase") or "starting"
                 return {
                     "available": True,
                     "ready": bool(health.get("ready")),
                     "qr": None,
                     "lastError": "Loading WhatsApp scanner — QR will appear shortly.",
-                    "phase": health.get("phase") or "starting",
-                    "loadingPercent": 15,
+                    "phase": phase,
+                    "loadingPercent": 15 if phase in ("booting", "starting") else 25,
                     "sessionLinked": bool(health.get("sessionLinked")),
                     "sessionRestoring": False,
                     "sessionLocked": False,
                     "qrGeneration": 0,
+                    "startupSeconds": health.get("startupSeconds", 0),
                     "hosted": hosted,
                     "enabled": True,
                 }
