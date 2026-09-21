@@ -5558,23 +5558,26 @@ async function init() {
   setDefaultServiceModes();
   populateServices();
   renderBill();
-  await refreshOfferSelect();
   startBillDateClock();
+  updateBillMeta();
 
-  try {
-    await migrateLocalStorageIfNeeded();
-    await loadBillCounter();
-  } catch (err) {
-    console.warn("Bill counter unavailable:", err);
-    updateBillMeta();
-  }
+  // Show billing UI immediately — history, offers, and counter load in background.
+  hideAppLoader();
 
-  try {
-    await refreshBillHistory();
-  } catch (err) {
+  void refreshOfferSelect().catch((err) => console.warn("Offers unavailable:", err));
+  void (async () => {
+    try {
+      await migrateLocalStorageIfNeeded();
+      await loadBillCounter();
+    } catch (err) {
+      console.warn("Bill counter unavailable:", err);
+      updateBillMeta();
+    }
+  })();
+  void refreshBillHistory().catch((err) => {
     console.warn("Bill history unavailable:", err);
     billHistoryCache = [];
-  }
+  });
 
   els.serviceSelect.addEventListener("change", onServiceChange);
   els.serviceTiles?.querySelectorAll(".service-tile").forEach((tile) => {

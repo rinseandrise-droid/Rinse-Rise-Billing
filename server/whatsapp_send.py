@@ -33,14 +33,30 @@ def whatsapp_enabled() -> bool:
     return os.environ.get("WHATSAPP_ENABLED", "1") not in ("0", "false", "False", "no")
 
 
-def bridge_is_running() -> bool:
+def bridge_is_running(*, timeout: int | None = None) -> bool:
     try:
         req = urllib.request.Request(f"{BRIDGE_URL}/health", method="GET")
-        timeout = 5 if is_cloud_deployment() else 2
+        if timeout is None:
+            timeout = 5 if is_cloud_deployment() else 2
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
+
+
+def bridge_health_snapshot(*, timeout: int = 2) -> dict[str, Any]:
+    """Fast WhatsApp snapshot for /api/health — must not block page load."""
+    if not whatsapp_enabled():
+        return {"available": False, "ready": False, "phase": "disabled"}
+    try:
+        health = _bridge_request("/health", timeout=timeout)
+        return {
+            "available": True,
+            "ready": bool(health.get("ready")),
+            "phase": health.get("phase") or "starting",
+        }
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return {"available": False, "ready": False, "phase": "offline"}
 
 
 def try_start_bridge(*, wait_seconds: float = 0) -> bool:

@@ -48,6 +48,7 @@ from offer_broadcast import get_broadcast_job, save_offer_image, start_offer_bro
 from offers import get_offers, save_offers
 from rates import get_rates, save_rates
 from whatsapp_send import (
+    bridge_health_snapshot,
     bridge_is_running,
     get_bridge_status,
     get_or_create_invoice_pdf,
@@ -135,12 +136,9 @@ def live():
 
 @app.route("/api/health")
 def health():
-    from db import _invalidate_postgres_probe, _postgres_probe
-
-    _invalidate_postgres_probe()
     config = database_config_status()
     wa_on = whatsapp_enabled()
-    wa_available = bridge_is_running() if wa_on else False
+    wa_snapshot = bridge_health_snapshot(timeout=2) if wa_on else {"available": False, "ready": False}
     db_ok = False
     db_error = None
     try:
@@ -171,8 +169,9 @@ def health():
             "dbError": db_error,
             "fixSteps": fix_steps or config.get("fixSteps"),
             "whatsappEnabled": wa_on,
-            "whatsappAvailable": wa_available,
-            "whatsappReady": get_bridge_status().get("ready") if wa_available else False,
+            "whatsappAvailable": wa_snapshot.get("available", False),
+            "whatsappReady": wa_snapshot.get("ready", False),
+            "whatsappPhase": wa_snapshot.get("phase"),
             "hosted": is_cloud_deployment(),
             "persistence": persistence_status(),
         }
