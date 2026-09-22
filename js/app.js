@@ -1559,13 +1559,32 @@ function getCustomerOrders(phone) {
   );
 }
 
-async function refreshBillHistory({ silent = false } = {}) {
+let billHistoryRefreshPromise = null;
+
+function upsertBillInCache(bill) {
+  if (!bill?.id) return;
+  const idx = billHistoryCache.findIndex((entry) => entry.id === bill.id);
+  if (idx >= 0) {
+    billHistoryCache[idx] = bill;
+  } else {
+    billHistoryCache.unshift(bill);
+  }
+}
+
+async function refreshBillHistory({ silent = false, force = false } = {}) {
+  if (billHistoryRefreshPromise && !force) {
+    return billHistoryRefreshPromise;
+  }
   const showOverlay = !silent && els.historyView && !els.historyView.classList.contains("hidden");
   if (showOverlay) setSectionLoading(els.historyView, true, "Loading bills…");
-  try {
+  billHistoryRefreshPromise = (async () => {
     billHistoryCache = await API.getBills();
     return billHistoryCache;
+  })();
+  try {
+    return await billHistoryRefreshPromise;
   } finally {
+    billHistoryRefreshPromise = null;
     if (showOverlay) setSectionLoading(els.historyView, false);
   }
 }
@@ -1697,29 +1716,35 @@ function updateProfileHint(profile, isNew = false, isFavorite = false) {
   updateFavoriteUi(!!(isFavorite || profile.isFavorite), true);
 }
 
+let customerProfileTimer = null;
+
 function loadCustomerProfileByPhone() {
   const phone = els.customerPhone.value.trim();
   const key = normalizePhoneKey(phone);
 
+  clearTimeout(customerProfileTimer);
   if (key.length < 10) {
     updateProfileHint(null);
     updateFavoriteUi(false, false);
     return;
   }
 
-  Promise.all([fetchCustomerProfile(phone), API.getCustomerFavorite(key).catch(() => ({ isFavorite: false }))])
-    .then(([{ profile }, favoriteData]) => {
-      const isFavorite = !!favoriteData.isFavorite;
-      if (profile) {
-        if (!els.customerName.value.trim()) {
-          els.customerName.value = profile.name;
+  customerProfileTimer = setTimeout(() => {
+    Promise.all([fetchCustomerProfile(phone), API.getCustomerFavorite(key).catch(() => ({ isFavorite: false }))])
+      .then(([{ profile }, favoriteData]) => {
+        if (normalizePhoneKey(els.customerPhone.value.trim()) !== key) return;
+        const isFavorite = !!favoriteData.isFavorite;
+        if (profile) {
+          if (!els.customerName.value.trim()) {
+            els.customerName.value = profile.name;
+          }
+          updateProfileHint({ ...profile, isFavorite: isFavorite || profile.isFavorite }, false, isFavorite);
+        } else {
+          updateProfileHint(null, true, isFavorite);
+          updateFavoriteUi(isFavorite, true);
         }
-        updateProfileHint({ ...profile, isFavorite: isFavorite || profile.isFavorite }, false, isFavorite);
-      } else {
-        updateProfileHint(null, true, isFavorite);
-        updateFavoriteUi(isFavorite, true);
-      }
-    });
+      });
+  }, 400);
 }
 
 function profileToStats(profile, recentOrders) {
@@ -3445,12 +3470,11 @@ async function saveBillToDatabase(
     const parsed = parseInt(String(saved.billNo).replace(/\D/g, ""), 10);
     if (!Number.isNaN(parsed)) billCounter = parsed + 1;
   }
+  if (saved) {
+    upsertBillInCache(saved);
+  }
   if (refreshHistory) {
-    try {
-      await refreshBillHistory();
-    } catch {
-      /* Bill is already saved — don't fail the whole action. */
-    }
+    void refreshBillHistory({ silent: true }).catch(() => {});
   }
   try {
     const counterData = await API.getBillCounter();
@@ -3490,9 +3514,23 @@ function showHistoryView() {
   historyPeriodFilter = "today";
   historyCustomDate = "";
   withButtonLoading(els.historyBtn, async () => {
+    if (billHistoryCache.length) {
+      syncHistoryPeriodUi();
+      renderHistoryList();
+      renderHistoryDetail(null);
+      void refreshBillHistory({ silent: true, force: true }).then(() => {
+        syncHistoryPeriodUi();
+        renderHistoryList();
+        if (selectedHistoryId) {
+          const bill = billHistoryCache.find((entry) => entry.id === selectedHistoryId);
+          if (bill) renderHistoryDetail(bill);
+        }
+      }).catch(() => {});
+      return;
+    }
     setSectionLoading(els.historyView, true, "Loading bills…");
     try {
-      await refreshBillHistory({ silent: true });
+      await refreshBillHistory({ silent: true, force: true });
       syncHistoryPeriodUi();
       renderHistoryList();
       renderHistoryDetail(null);
@@ -4293,7 +4331,7 @@ async function updateBillDeliveryStatus(billId, status, btn) {
       setSectionLoading(els.historyView, true, "Updating status…");
       try {
         const bill = await API.updateBillStatus(billId, status);
-        await refreshBillHistory({ silent: true });
+        upsertBillInCache(bill);
         selectedHistoryId = bill.id;
         renderHistoryList();
         renderHistoryDetail(bill);
@@ -4803,7 +4841,7 @@ async function saveHistoryEdit(btn) {
       try {
         const updated = await API.updateBill(historyEditDraft.id, payload);
         historyEditDraft = null;
-        await refreshBillHistory({ silent: true });
+        upsertBillInCache(updated);
         selectedHistoryId = updated.id;
         renderHistoryList();
         renderHistoryDetail(updated);
@@ -5224,13 +5262,11 @@ async function sendHistoryWhatsApp(bill, btn, { skipPaymentValidation = false } 
       setSectionLoading(els.historyView, true, "Sending on WhatsApp…");
       try {
         await shareBillOnWhatsApp(phone, bill, { skipPaymentValidation });
-        await refreshBillHistory({ silent: true });
-        const updated = billHistoryCache.find((b) => b.id === bill.id);
-        if (updated) {
-          selectedHistoryId = updated.id;
-          renderHistoryList();
-          renderHistoryDetail(updated);
-        }
+        const updated = { ...bill, sentVia: "whatsapp" };
+        upsertBillInCache(updated);
+        selectedHistoryId = updated.id;
+        renderHistoryList();
+        renderHistoryDetail(updated);
       } finally {
         setSectionLoading(els.historyView, false);
       }
@@ -5474,7 +5510,7 @@ async function sendWhatsApp() {
       try {
         buildReceipt();
         const saved = await saveBillToDatabase("whatsapp", {
-          refreshHistory: true,
+          refreshHistory: false,
           deliveryStatus: "done",
           completedAt: new Date().toISOString(),
         });
@@ -5527,7 +5563,7 @@ function clearBill() {
 async function init() {
   try {
   try {
-    await API.health();
+    await API.live();
   } catch {
     if (isHostedDeployment()) {
       try {
@@ -5678,7 +5714,7 @@ async function init() {
   if (isHostedDeployment()) {
     API.getWhatsAppStatus(true).catch(() => {});
   }
-  setInterval(refreshWhatsAppStatus, 5000);
+  setInterval(refreshWhatsAppStatus, 15000);
   els.historySearch.addEventListener("input", (e) => {
     historySearchQuery = e.target.value;
     renderHistoryList();

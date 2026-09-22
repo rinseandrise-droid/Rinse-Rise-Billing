@@ -58,6 +58,10 @@ const API = {
     return this.request("/api/health");
   },
 
+  live() {
+    return this.request("/api/live");
+  },
+
   getBillCounter() {
     return this.request("/api/settings/bill-counter");
   },

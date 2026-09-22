@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -125,6 +126,8 @@ def _collect_postgres_urls() -> list[str]:
 
 _pg_reachable: bool | None = None
 _using_sqlite_fallback = False
+_pg_pool = None
+_pg_pool_lock = threading.Lock()
 
 
 def _invalidate_postgres_probe() -> None:
@@ -397,37 +400,51 @@ def _postgres_connect_url(url: str) -> str:
     return url
 
 
-@contextmanager
-def get_connection() -> Iterator[DbConnection]:
-    if is_postgres():
-        import psycopg2
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    with _pg_pool_lock:
+        if _pg_pool is not None:
+            return _pg_pool
         from psycopg2.extras import RealDictCursor
+        from psycopg2.pool import ThreadedConnectionPool
 
         urls = [_postgres_connect_url(u) for u in _collect_postgres_urls()]
+        if not urls:
+            raise RuntimeError("No PostgreSQL connection URL available")
         last_error: Exception | None = None
         for url in urls:
             try:
-                conn = psycopg2.connect(
+                _pg_pool = ThreadedConnectionPool(
+                    1,
+                    8,
                     url,
                     cursor_factory=RealDictCursor,
                     connect_timeout=10,
                     options="-c statement_timeout=15000 -c lock_timeout=8000",
                 )
-                wrapper = DbConnection(conn, True)
-                try:
-                    yield wrapper
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-                finally:
-                    conn.close()
-                return
+                return _pg_pool
             except Exception as exc:
                 last_error = exc
                 continue
-        _invalidate_postgres_probe()
         raise last_error or RuntimeError("No PostgreSQL connection URL available")
+
+
+@contextmanager
+def get_connection() -> Iterator[DbConnection]:
+    if is_postgres():
+        pool = _get_pg_pool()
+        conn = pool.getconn()
+        wrapper = DbConnection(conn, True)
+        try:
+            yield wrapper
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            pool.putconn(conn)
     else:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         raw = sqlite3.connect(DB_PATH)

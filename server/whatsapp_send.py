@@ -308,7 +308,7 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
         }
 
     if hosted:
-        ensure_hosted_whatsapp_stack(wait_seconds=20 if auto_start else 0)
+        ensure_hosted_whatsapp_stack(wait_seconds=8 if auto_start else 0)
     elif auto_start and not bridge_is_running():
         try_start_bridge(wait_seconds=10)
 

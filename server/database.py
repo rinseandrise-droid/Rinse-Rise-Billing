@@ -158,9 +158,16 @@ def normalize_phone_key(phone: str) -> str:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+_db_ready = False
+
+
 def ensure_database() -> None:
-    """Create or migrate tables; safe to call before API requests."""
+    """Create or migrate tables once per process — not on every API request."""
+    global _db_ready
+    if _db_ready:
+        return
     init_db()
+    _db_ready = True
 
 
 def init_db() -> None:
@@ -364,22 +371,20 @@ def _starch_qty_for_save(item: dict[str, Any]) -> int:
     return 0
 
 
-def _fetch_items(conn: DbConnection, bill_id: int) -> list[dict[str, Any]]:
-    item_cols = conn.table_columns("bill_items")
-    has_unit = "unit" in item_cols
-    has_starch = "starch" in item_cols
-    select_cols = "item_key, name, service, category, rate, qty"
-    if has_unit:
-        select_cols += ", unit"
-    if has_starch:
-        select_cols += ", starch"
-    rows = conn.execute(
-        f"""
-        SELECT {select_cols}
-        FROM bill_items WHERE bill_id = ? ORDER BY id
-        """,
-        (bill_id,),
-    ).fetchall()
+_bill_item_columns_cache: dict[str, set[str]] = {}
+
+
+def _bill_item_columns(conn: DbConnection) -> set[str]:
+    cache_key = "pg" if conn._is_pg else "sqlite"
+    cached = _bill_item_columns_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    cols = conn.table_columns("bill_items")
+    _bill_item_columns_cache[cache_key] = cols
+    return cols
+
+
+def _rows_to_items(rows: list[Any], *, has_unit: bool, has_starch: bool) -> list[dict[str, Any]]:
     items = []
     for r in rows:
         keys = _row_keys(r)
@@ -397,6 +402,55 @@ def _fetch_items(conn: DbConnection, bill_id: int) -> list[dict[str, Any]]:
         )
         items.append(item)
     return items
+
+
+def _fetch_items(conn: DbConnection, bill_id: int) -> list[dict[str, Any]]:
+    item_cols = _bill_item_columns(conn)
+    has_unit = "unit" in item_cols
+    has_starch = "starch" in item_cols
+    select_cols = "item_key, name, service, category, rate, qty"
+    if has_unit:
+        select_cols += ", unit"
+    if has_starch:
+        select_cols += ", starch"
+    rows = conn.execute(
+        f"""
+        SELECT {select_cols}
+        FROM bill_items WHERE bill_id = ? ORDER BY id
+        """,
+        (bill_id,),
+    ).fetchall()
+    return _rows_to_items(rows, has_unit=has_unit, has_starch=has_starch)
+
+
+def _fetch_items_batch(conn: DbConnection, bill_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    if not bill_ids:
+        return {}
+    item_cols = _bill_item_columns(conn)
+    has_unit = "unit" in item_cols
+    has_starch = "starch" in item_cols
+    select_cols = "bill_id, item_key, name, service, category, rate, qty"
+    if has_unit:
+        select_cols += ", unit"
+    if has_starch:
+        select_cols += ", starch"
+    placeholders = ", ".join("?" for _ in bill_ids)
+    rows = conn.execute(
+        f"""
+        SELECT {select_cols}
+        FROM bill_items
+        WHERE bill_id IN ({placeholders})
+        ORDER BY bill_id, id
+        """,
+        tuple(bill_ids),
+    ).fetchall()
+    buckets: dict[int, list[Any]] = {bill_id: [] for bill_id in bill_ids}
+    for row in rows:
+        buckets[int(row["bill_id"])].append(row)
+    return {
+        bill_id: _rows_to_items(buckets[bill_id], has_unit=has_unit, has_starch=has_starch)
+        for bill_id in bill_ids
+    }
 
 
 def _bill_service_modes_from_row(row: Any) -> tuple[str, str]:
@@ -458,7 +512,11 @@ def get_all_bills() -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT * FROM bills ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        return [row_to_bill(r, _fetch_items(conn, r["id"])) for r in rows]
+        if not rows:
+            return []
+        bill_ids = [int(r["id"]) for r in rows]
+        items_by_bill = _fetch_items_batch(conn, bill_ids)
+        return [row_to_bill(r, items_by_bill.get(int(r["id"]), [])) for r in rows]
 
 
 def get_bill_by_id(bill_id: int) -> dict[str, Any] | None:
