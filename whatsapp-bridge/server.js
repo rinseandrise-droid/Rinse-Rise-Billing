@@ -21,6 +21,20 @@ function ensureWwebjs() {
   console.log("[WhatsApp] Libraries loaded.");
 }
 
+process.on("uncaughtException", (err) => {
+  console.error("[WhatsApp] Uncaught exception:", err?.message || err);
+  state.phase = "error";
+  state.lastError = `Scanner crashed: ${err?.message || err}. Restarting…`;
+  initInProgress = false;
+  setTimeout(() => {
+    forceFreshQrLink("uncaught").catch((e) => console.error("[WhatsApp] Recovery failed:", e.message));
+  }, 2000);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[WhatsApp] Unhandled rejection:", reason);
+});
+
 const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT || 3001);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
 const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || path.join(DATA_DIR, "whatsapp-auth");
@@ -630,7 +644,7 @@ function validateHostedChrome() {
 
 function createClient() {
   ensureWwebjs();
-  const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE === "1");
+  const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE !== "0");
   const puppeteerConfig = {
     headless: true,
     args: [
@@ -907,17 +921,20 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
       }),
     ]);
   } catch (err) {
-    const timedOut = err?.message === "INIT_TIMEOUT" || /timeout/i.test(String(err?.message || ""));
-    if (IS_HOSTED && !_retried && timedOut) {
-      console.warn("[WhatsApp] Scanner init timed out — wiping session and retrying once for QR…");
+    const errText = String(err?.message || err || "");
+    const timedOut = errText === "INIT_TIMEOUT" || /timeout/i.test(errText);
+    const injectFailed = /inject|ExecutionContext|evaluate/i.test(`${errText}${err?.stack || ""}`);
+    if (IS_HOSTED && !_retried && (timedOut || injectFailed || errText)) {
+      console.warn("[WhatsApp] Scanner init failed — retrying once with remote WA Web cache…", errText);
+      process.env.WHATSAPP_REMOTE_CACHE = "1";
       await destroyClient();
       wipeAuthDir();
       initInProgress = false;
       return initializeClient({ fresh: true, _retried: true });
     }
     state.phase = "error";
-    state.lastError = `Scanner failed to start: ${err.message}. Click Reset Connection and wait for a fresh QR.`;
-    console.error("[WhatsApp] initialize() failed:", err.message);
+    state.lastError = `Scanner failed to start: ${errText}. Click Reset Connection and wait for a fresh QR.`;
+    console.error("[WhatsApp] initialize() failed:", errText);
     throw err;
   } finally {
     initInProgress = false;

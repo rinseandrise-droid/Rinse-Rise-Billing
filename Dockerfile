@@ -12,7 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/app/data \
     WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth \
     WHATSAPP_CACHE_DIR=/app/data/whatsapp-cache \
-    WHATSAPP_ENABLED=1
+    WHATSAPP_ENABLED=1 \
+    WHATSAPP_REMOTE_CACHE=1
 
 WORKDIR /app
 

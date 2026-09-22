@@ -48,13 +48,61 @@ function bootingStatus() {
 
 function sendBooting(req, res) {
   const path = String(req.url || "").split("?")[0];
-  const body = path === "/status" ? bootingStatus() : bootingHealth();
+  const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  let body;
+  if (path === "/status" && elapsed >= 90 && !internalBridgeUp) {
+    body = JSON.stringify({
+      ready: false,
+      qr: null,
+      lastError:
+        "Scanner crashed while loading — click Reset Connection, wait 20 seconds, then scan the new QR.",
+      phase: "error",
+      loadingPercent: 0,
+      recovering: false,
+      waState: null,
+      authenticatingSeconds: 0,
+      startupSeconds: elapsed,
+      sessionLinked: false,
+      sessionRestoring: false,
+      qrGeneration: 0,
+      sendInProgress: false,
+      sendBusyForSec: 0,
+      hosted: true,
+    });
+  } else {
+    body = path === "/status" ? bootingStatus() : bootingHealth();
+  }
   res.writeHead(200, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
   });
   res.end(body);
 }
+
+let internalBridgeUp = false;
+setInterval(() => {
+  const req = http.request(
+    {
+      hostname: INTERNAL_HOST,
+      port: INTERNAL_PORT,
+      path: "/health",
+      method: "GET",
+      timeout: 2000,
+    },
+    (res) => {
+      internalBridgeUp = res.statusCode === 200;
+      res.resume();
+    }
+  );
+  req.on("timeout", () => {
+    req.destroy();
+    internalBridgeUp = false;
+  });
+  req.on("error", () => {
+    internalBridgeUp = false;
+  });
+  req.end();
+}, 4000);
 
 function forward(req, res) {
   const chunks = [];
