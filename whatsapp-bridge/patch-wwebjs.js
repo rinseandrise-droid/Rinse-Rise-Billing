@@ -13,8 +13,11 @@ if (!fs.existsSync(utilsPath)) {
 }
 
 let src = fs.readFileSync(utilsPath, "utf8");
-if (src.includes("PATCHED_CONTACT_GETTER_GUARD")) {
-  console.log("[patch-wwebjs] Already patched");
+const alreadyV1 = src.includes("PATCHED_CONTACT_GETTER_GUARD");
+const alreadyV2 = src.includes("PATCHED_CONTACT_GETTER_V2");
+
+if (alreadyV2) {
+  console.log("[patch-wwebjs] Already patched (v2)");
   process.exit(0);
 }
 
@@ -94,17 +97,72 @@ const newGetContactModelStart = `    window.WWebJS.getContactModel = (contact) =
             res.id = contact.phoneNumber;
         }`;
 
-if (!src.includes(oldGetContact)) {
-  console.warn("[patch-wwebjs] getContact block not found — library version may differ");
-  process.exit(0);
+if (!alreadyV1) {
+  if (!src.includes(oldGetContact)) {
+    console.warn("[patch-wwebjs] getContact block not found — library version may differ");
+    process.exit(0);
+  }
+  src = src.replace(oldGetContact, newGetContact);
+  if (src.includes(oldGetContactModelStart)) {
+    src = src.replace(oldGetContactModelStart, newGetContactModelStart);
+  } else {
+    console.warn("[patch-wwebjs] getContactModel block not found — partial patch only");
+  }
 }
 
-src = src.replace(oldGetContact, newGetContact);
-if (src.includes(oldGetContactModelStart)) {
-  src = src.replace(oldGetContactModelStart, newGetContactModelStart);
-} else {
-  console.warn("[patch-wwebjs] getContactModel block not found — partial patch only");
+const unsafeContactMethods = `        const ContactMethods = window.require('WAWebContactGetters');
+        res.isMe = ContactMethods.getIsMe(contact);
+        res.isUser = ContactMethods.getIsUser(contact);
+        res.isGroup = ContactMethods.getIsGroup(contact);
+        res.isWAContact = ContactMethods.getIsWAContact(contact);
+        res.userid = ContactMethods.getUserid(contact);
+        res.verifiedName = ContactMethods.getVerifiedName(contact);
+        res.verifiedLevel = ContactMethods.getVerifiedLevel(contact);
+        res.statusMute = ContactMethods.getStatusMute(contact);
+        res.name = ContactMethods.getName(contact);
+        res.shortName = ContactMethods.getShortName(contact);
+        res.pushname = ContactMethods.getPushname(contact);
+
+        const { getIsMyContact } = window.require(
+            'WAWebFrontendContactGetters',
+        );
+        res.isMyContact = getIsMyContact(contact);
+        res.isEnterprise = ContactMethods.getIsEnterprise(contact);`;
+
+const safeContactMethods = `        /* PATCHED_CONTACT_GETTER_V2 */
+        const ContactMethods = window.require('WAWebContactGetters');
+        const safeContactGet = (fn, fallback) => {
+            try {
+                if (!contact?.id) return fallback;
+                return fn(contact);
+            } catch {
+                return fallback;
+            }
+        };
+        res.isMe = safeContactGet(ContactMethods.getIsMe, false);
+        res.isUser = safeContactGet(ContactMethods.getIsUser, false);
+        res.isGroup = safeContactGet(ContactMethods.getIsGroup, false);
+        res.isWAContact = safeContactGet(ContactMethods.getIsWAContact, false);
+        res.userid = safeContactGet(ContactMethods.getUserid, '');
+        res.verifiedName = safeContactGet(ContactMethods.getVerifiedName, null);
+        res.verifiedLevel = safeContactGet(ContactMethods.getVerifiedLevel, null);
+        res.statusMute = safeContactGet(ContactMethods.getStatusMute, false);
+        res.name = safeContactGet(ContactMethods.getName, '');
+        res.shortName = safeContactGet(ContactMethods.getShortName, '');
+        res.pushname = safeContactGet(ContactMethods.getPushname, '');
+        try {
+            const { getIsMyContact } = window.require('WAWebFrontendContactGetters');
+            res.isMyContact = safeContactGet(getIsMyContact, false);
+        } catch {
+            res.isMyContact = false;
+        }
+        res.isEnterprise = safeContactGet(ContactMethods.getIsEnterprise, false);`;
+
+if (src.includes(unsafeContactMethods)) {
+  src = src.replace(unsafeContactMethods, safeContactMethods);
+} else if (!src.includes("PATCHED_CONTACT_GETTER_V2")) {
+  console.warn("[patch-wwebjs] ContactMethods block not found — v2 patch skipped");
 }
 
 fs.writeFileSync(utilsPath, src, "utf8");
-console.log("[patch-wwebjs] Patched contact getters in Utils.js");
+console.log("[patch-wwebjs] Patched contact getters in Utils.js (v2)");

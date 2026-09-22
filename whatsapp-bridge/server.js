@@ -1127,49 +1127,110 @@ async function sendMediaToChat(chatId, media, caption) {
   });
 }
 
+/** Send PDF via in-page WWebJS — avoids broken contact getters in client.sendMessage. */
+async function sendDocumentRobust(chatId, filePath, filename, caption) {
+  if (!client?.pupPage) throw new Error("WhatsApp not connected.");
+  const media = MessageMedia.fromFilePath(filePath);
+  media.filename = filename || path.basename(filePath);
+  const mediaPayload = {
+    data: media.data,
+    mimetype: media.mimetype,
+    filename: media.filename,
+  };
+
+  const result = await client.pupPage.evaluate(
+    async (targetChatId, payload, captionText) => {
+      const fail = (error) => ({ ok: false, error: String(error || "send failed") });
+      try {
+        const widFactory = window.require("WAWebWidFactory");
+        const chatWid = widFactory.createWid(targetChatId);
+        let chat = window.require("WAWebCollections").Chat.get(chatWid);
+        if (!chat) {
+          const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
+          chat = found?.chat;
+        }
+        if (!chat) return fail("Could not open WhatsApp chat for this number.");
+
+        const msg = await window.WWebJS.sendMessage(chat, "", {
+          media: payload,
+          caption: captionText || "",
+          sendMediaAsDocument: true,
+          linkPreview: false,
+        });
+        return msg ? { ok: true } : fail("WhatsApp rejected the PDF send.");
+      } catch (err) {
+        return fail(err?.message || err);
+      }
+    },
+    chatId,
+    mediaPayload,
+    caption || ""
+  );
+
+  if (result?.ok) return true;
+  const err = new Error(result?.error || "Failed to send on WhatsApp.");
+  if (/not registered|could not open whatsapp chat/i.test(String(result?.error || ""))) {
+    err.code = "NOT_ON_WHATSAPP";
+  }
+  throw err;
+}
+
 async function performSend(digits, message, filePath, filename) {
   ensureWwebjs();
   await quickSendCheck();
 
-  const media = MessageMedia.fromFilePath(filePath);
-  media.filename = filename || path.basename(filePath);
   const caption = message || "";
-  const phoneChatId = `${digits}@c.us`;
+  const candidateChatIds = [];
+  const addChatId = (chatId) => {
+    if (chatId && !candidateChatIds.includes(chatId)) candidateChatIds.push(chatId);
+  };
 
-  // Fast path — most Indian numbers work with @c.us directly (skip slow getNumberId).
-  try {
-    await sendMediaToChat(phoneChatId, media, caption);
-    return;
-  } catch (err) {
-    if (err?.code === "NOT_ON_WHATSAPP") throw err;
-    console.warn("[WhatsApp] Direct send failed, trying registered id:", err?.message || err);
-  }
-
+  addChatId(`${digits}@c.us`);
   const registeredId = await lookupRegisteredChatId(digits);
-  if (!registeredId) {
-    const err = new Error("This phone number is not registered on WhatsApp.");
-    err.code = "NOT_ON_WHATSAPP";
-    throw err;
-  }
+  addChatId(registeredId);
+  addChatId(`${digits}@s.whatsapp.net`);
 
-  const targets = registeredId === phoneChatId ? [phoneChatId] : [registeredId, phoneChatId];
   let lastErr = null;
-  for (const chatId of targets) {
+  for (const chatId of candidateChatIds) {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        await sendMediaToChat(chatId, media, caption);
+        await sendDocumentRobust(chatId, filePath, filename, caption);
         return;
       } catch (err) {
         lastErr = err;
-        if (err?.code === "NOT_ON_WHATSAPP") throw err;
-        if (isLidError(err) || isContactGetterError(err)) break;
+        if (err?.code === "NOT_ON_WHATSAPP") break;
+        if (isContactGetterError(err) || isLidError(err)) break;
         if (isCommsError(err) && attempt < 2) {
           await sleep(1500);
           continue;
         }
-        throw err;
+        if ((isSessionError(err) || isStoreError(err)) && attempt < 2) {
+          await sleep(2000);
+          continue;
+        }
       }
     }
+  }
+
+  if (lastErr?.code === "NOT_ON_WHATSAPP") {
+    throw lastErr;
+  }
+
+  try {
+    const media = MessageMedia.fromFilePath(filePath);
+    media.filename = filename || path.basename(filePath);
+    await sendMediaToChat(`${digits}@c.us`, media, caption);
+    return;
+  } catch (err) {
+    lastErr = err;
+  }
+
+  if (isContactGetterError(lastErr)) {
+    const err = new Error(
+      "WhatsApp contact sync error — click Reset Connection, scan QR again, then retry Send."
+    );
+    err.code = "CONTACT_GETTER";
+    throw err;
   }
 
   throw lastErr || new Error("Failed to send on WhatsApp.");
@@ -1477,10 +1538,10 @@ app.post("/send", async (req, res) => {
         });
       }
 
-      if (isLidError(err)) {
+      if (isLidError(err) || isContactGetterError(err) || err.code === "CONTACT_GETTER") {
         return res.status(500).json({
           error:
-            "WhatsApp could not open a chat for this number. Click Reset Connection in WhatsApp settings, scan QR again, then retry.",
+            "WhatsApp could not open a chat for this number. Click Reset Connection, wait for a fresh QR, scan again, then retry Send.",
           needsReconnect: true,
         });
       }
