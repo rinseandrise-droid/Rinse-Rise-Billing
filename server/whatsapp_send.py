@@ -103,7 +103,7 @@ def _hosted_bridge_env() -> dict[str, str]:
     env_base.setdefault("DATA_DIR", str(data_dir()))
     env_base.setdefault("PUPPETEER_EXECUTABLE_PATH", "/usr/bin/chromium")
     env_base.setdefault("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "true")
-    env_base.setdefault("WHATSAPP_REMOTE_CACHE", "1")
+    env_base.setdefault("WHATSAPP_REMOTE_CACHE", "0")
     return env_base
 
 

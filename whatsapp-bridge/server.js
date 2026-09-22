@@ -348,6 +348,9 @@ function markReady(source) {
         state.ready = true;
         state.lastError = null;
         console.log(`[WhatsApp] Connected and ready (${source}).`);
+        applyWhatsAppPagePatches().catch((err) =>
+          console.warn("[WhatsApp] Page patch deferred:", err.message)
+        );
         return;
       }
       state.phase = "loading";
@@ -679,19 +682,20 @@ function createClient() {
     takeoverTimeoutMs: 0,
   };
 
+  ensureWaWebCache();
+  clientOptions.webVersion = WA_WEB_VERSION;
   if (useRemoteCache) {
     clientOptions.webVersionCache = {
       type: "remote",
-      remotePath:
-        "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html",
+      remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`,
     };
-    console.log("[WhatsApp] Using remote WA Web cache fallback.");
+    console.log(`[WhatsApp] WA Web remote cache pinned: ${WA_WEB_VERSION}`);
   } else {
-    clientOptions.webVersion = WA_WEB_VERSION;
     clientOptions.webVersionCache = {
       type: "local",
       path: CACHE_DIR,
     };
+    console.log(`[WhatsApp] WA Web local cache: ${WA_WEB_VERSION}`);
   }
 
   return new Client(clientOptions);
@@ -839,6 +843,7 @@ async function destroyClient() {
     console.warn("[WhatsApp] Destroy:", err.message);
   }
   client = null;
+  pagePatchesApplied = false;
 }
 
 function wipeAuthDir() {
@@ -1028,6 +1033,53 @@ function normalizePhone(phone) {
   return digits;
 }
 
+function isPhoneChatId(chatId) {
+  if (!chatId || typeof chatId !== "string") return false;
+  if (chatId.includes("@lid")) return false;
+  return chatId.endsWith("@c.us") || chatId.endsWith("@s.whatsapp.net");
+}
+
+/** Always use phone-based chat IDs — never @lid (causes getter crashes on newer WA Web). */
+function phoneChatTargets(digits) {
+  return [`${digits}@c.us`, `${digits}@s.whatsapp.net`];
+}
+
+let pagePatchesApplied = false;
+async function applyWhatsAppPagePatches() {
+  if (!client?.pupPage || pagePatchesApplied) return;
+  try {
+    await client.pupPage.evaluate(() => {
+      try {
+        const gating = window.require("WAWebLid1X1MigrationGating");
+        if (gating?.Lid1X1MigrationUtils) {
+          gating.Lid1X1MigrationUtils.isLidMigrated = () => false;
+        }
+      } catch {
+        /* module layout differs on some WA Web builds */
+      }
+      try {
+        const utils = window.require("WAWebLidMigrationUtils");
+        if (typeof utils?.toUserLid === "function") {
+          const original = utils.toUserLid.bind(utils);
+          utils.toUserLid = (wid) => {
+            try {
+              return original(wid);
+            } catch {
+              return wid;
+            }
+          };
+        }
+      } catch {
+        /* optional */
+      }
+    });
+    pagePatchesApplied = true;
+    console.log("[WhatsApp] Applied in-page LID migration patches.");
+  } catch (err) {
+    console.warn("[WhatsApp] Page patches failed:", err.message);
+  }
+}
+
 function serializeWid(wid) {
   if (!wid) return null;
   if (typeof wid === "string") return wid;
@@ -1037,15 +1089,22 @@ function serializeWid(wid) {
 }
 
 async function ensureChatRegistered(chatId) {
-  if (!client?.pupPage || !chatId || chatId.includes("@lid")) return false;
+  if (!client?.pupPage || !isPhoneChatId(chatId)) return false;
   try {
     return await client.pupPage.evaluate(async (targetChatId) => {
-      const widFactory = window.require("WAWebWidFactory");
-      const chatWid = widFactory.createWid(targetChatId);
-      const chat =
-        window.require("WAWebCollections").Chat.get(chatWid) ||
-        (await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid))?.chat;
-      return Boolean(chat);
+      try {
+        const chat = await window.WWebJS.getChat(targetChatId, { getAsModel: false });
+        if (chat?.id) return true;
+      } catch {
+        /* fall through */
+      }
+      try {
+        const chatWid = window.require("WAWebWidFactory").createWid(targetChatId);
+        const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
+        return Boolean(found?.chat?.id);
+      } catch {
+        return false;
+      }
     }, chatId);
   } catch (err) {
     console.warn("[WhatsApp] ensureChatRegistered:", err.message);
@@ -1053,28 +1112,9 @@ async function ensureChatRegistered(chatId) {
   }
 }
 
-/** Phone-only chat IDs — avoid @lid lookups that trigger WhatsApp Web getter crashes. */
+/** Phone-only chat IDs — never @lid from getNumberId (breaks PDF send on hosted WA Web). */
 async function resolveSendTargets(digits) {
-  const phoneChatId = `${digits}@c.us`;
-  let registeredId = null;
-
-  try {
-    const registered = await client.getNumberId(digits);
-    registeredId = serializeWid(registered);
-  } catch (err) {
-    console.warn("[WhatsApp] getNumberId failed:", err.message);
-  }
-
-  if (!registeredId) {
-    const err = new Error("This phone number is not registered on WhatsApp.");
-    err.code = "NOT_ON_WHATSAPP";
-    throw err;
-  }
-
-  const targets = [];
-  if (registeredId !== phoneChatId) targets.push(registeredId);
-  targets.push(phoneChatId);
-  return targets;
+  return phoneChatTargets(digits);
 }
 
 const SEND_OPTIONS = { sendSeen: false, sendMediaAsDocument: true };
@@ -1148,42 +1188,39 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         code: code || null,
       });
 
-      const resolveChat = async (chatWid) => {
-        const collections = window.require("WAWebCollections");
-        let chat = collections.Chat.get(chatWid);
-        if (chat?.id) return chat;
+      const resolveChat = async (targetId) => {
+        if (String(targetId).includes("@lid")) return null;
 
+        try {
+          const chat = await window.WWebJS.getChat(targetId, { getAsModel: false });
+          if (chat?.id) return chat;
+        } catch {
+          /* try create/find */
+        }
+
+        const chatWid = window.require("WAWebWidFactory").createWid(targetId);
         try {
           const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
           if (found?.chat?.id) return found.chat;
         } catch {
-          /* try next resolver */
+          /* try find */
         }
 
         try {
-          chat = await collections.Chat.find(chatWid);
+          const chat = await window.require("WAWebCollections").Chat.find(chatWid);
           if (chat?.id) return chat;
         } catch {
-          /* try next resolver */
-        }
-
-        try {
-          const createChat = window.require("WAWebCreateChatAction");
-          if (createChat?.createChat) {
-            chat = await createChat.createChat(chatWid, "createChat");
-            if (chat?.id) return chat;
-          }
-        } catch {
-          /* no create API on this WA Web build */
+          /* no chat */
         }
 
         return null;
       };
 
       try {
-        const widFactory = window.require("WAWebWidFactory");
-        const chatWid = widFactory.createWid(targetChatId);
-        const chat = await resolveChat(chatWid);
+        if (String(targetChatId).includes("@lid")) {
+          return fail("Invalid chat target for phone send.", "NO_CHAT");
+        }
+        const chat = await resolveChat(targetChatId);
         if (!chat?.id) {
           return fail("Could not open WhatsApp chat for this number.", "NO_CHAT");
         }
@@ -1262,53 +1299,88 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   throw err;
 }
 
-async function resolveBillSendTargets(digits) {
+async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
   try {
-    return await resolveSendTargets(digits);
+    await client.sendMessage(chatId, media, {
+      caption: caption || "",
+      sendSeen: false,
+      sendMediaAsDocument: true,
+      linkPreview: false,
+    });
   } catch (err) {
-    if (err?.code !== "NOT_ON_WHATSAPP") throw err;
-    const fallback = [`${digits}@c.us`, `${digits}@s.whatsapp.net`];
-    const registeredId = await lookupRegisteredChatId(digits);
-    if (registeredId && !registeredId.includes("@lid")) {
-      fallback.unshift(registeredId);
-    }
-    return [...new Set(fallback.filter(Boolean))];
+    if (!isContactGetterError(err) && !isLidError(err)) throw err;
+    await sendDocumentRobust(chatId, filePath, filename, caption || "");
   }
 }
 
 async function performSend(digits, message, filePath, filename) {
   ensureWwebjs();
-  await assertSendReady({ maxCommsWaitMs: 8000 });
+  await applyWhatsAppPagePatches();
+  await assertSendReady({ maxCommsWaitMs: 10000 });
 
-  const caption = message || "";
-  const targets = await resolveBillSendTargets(digits);
+  const caption = String(message || "");
+  const shortCaption =
+    caption.split("\n")[0]?.trim() || "Your invoice from Rinse & Rise Laundryrite is attached.";
+  const media = MessageMedia.fromFilePath(filePath);
+  media.filename = filename || path.basename(filePath);
+  const targets = phoneChatTargets(digits);
+  const captionVariants = caption ? [caption, shortCaption, ""] : [""];
 
   let lastErr = null;
   for (const chatId of targets) {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
-        await ensureChatRegistered(chatId);
-        await sendDocumentRobust(chatId, filePath, filename, caption);
-        return;
-      } catch (err) {
-        lastErr = err;
-        if (err?.code === "NOT_ON_WHATSAPP") break;
-        if (err?.code === "CONTACT_GETTER" || isContactGetterError(err) || isLidError(err)) break;
-        if (isCommsError(err) && attempt < 3) {
-          await sleep(4000 * attempt);
-          continue;
-        }
-        if ((isSessionError(err) || isStoreError(err)) && attempt < 3) {
-          await sleep(2000);
-          continue;
+    for (const captionText of captionVariants) {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 3000 });
+          await ensureChatRegistered(chatId);
+          await sendBillPdfMessage(chatId, media, captionText, filePath, filename);
+
+          if (captionText !== caption && caption) {
+            try {
+              await client.sendMessage(chatId, caption, { sendSeen: false, linkPreview: false });
+            } catch (textErr) {
+              console.warn("[WhatsApp] PDF sent; follow-up text failed:", textErr.message);
+            }
+          }
+
+          console.log(`[WhatsApp] Bill PDF sent to ${chatId}`);
+          return;
+        } catch (err) {
+          lastErr = err;
+          console.warn(
+            `[WhatsApp] Bill send attempt (${chatId}, caption ${captionText.length} chars):`,
+            err.message
+          );
+          if (err?.code === "NOT_ON_WHATSAPP") break;
+          if (isCommsError(err) && attempt < 2) {
+            await sleep(3000);
+            continue;
+          }
+          if ((isSessionError(err) || isStoreError(err)) && attempt < 2) {
+            await sleep(2000);
+            continue;
+          }
         }
       }
+      if (lastErr?.code === "NOT_ON_WHATSAPP") break;
     }
+    if (lastErr?.code === "NOT_ON_WHATSAPP") break;
   }
 
   if (lastErr?.code === "NOT_ON_WHATSAPP") {
-    throw lastErr;
+    const err = new Error(
+      `Could not open WhatsApp chat for ${digits.slice(-10)}. Check the number is registered on WhatsApp.`
+    );
+    err.code = "NOT_ON_WHATSAPP";
+    throw err;
+  }
+
+  if (isContactGetterError(lastErr) || isLidError(lastErr)) {
+    const err = new Error(
+      `Could not send invoice to ${digits.slice(-10)}. Confirm the mobile number is correct and on WhatsApp.`
+    );
+    err.code = "CONTACT_GETTER";
+    throw err;
   }
 
   throw lastErr || new Error("Failed to send on WhatsApp.");
@@ -1619,8 +1691,9 @@ app.post("/send", async (req, res) => {
       if (isLidError(err) || isContactGetterError(err) || err.code === "CONTACT_GETTER") {
         return res.status(500).json({
           error:
-            "WhatsApp could not open a chat for this number. Click Reset Connection, wait for a fresh QR, scan again, then retry Send.",
-          needsReconnect: true,
+            err.message ||
+            "Could not send to this phone number on WhatsApp. Check the number is correct and registered on WhatsApp.",
+          needsReconnect: false,
         });
       }
 
