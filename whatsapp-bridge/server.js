@@ -84,7 +84,9 @@ let sendInProgress = false;
 let sendInProgressSince = 0;
 const SEND_LOCK_MAX_MS = Number(process.env.WHATSAPP_SEND_LOCK_MS || 60000);
 const SEND_OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || (IS_HOSTED ? 90000 : 60000));
-const GET_NUMBER_ID_TIMEOUT_MS = Number(process.env.WHATSAPP_NUMBER_LOOKUP_MS || 5000);
+const GET_NUMBER_ID_TIMEOUT_MS = Number(
+  process.env.WHATSAPP_NUMBER_LOOKUP_MS || (IS_HOSTED ? 12000 : 5000)
+);
 
 const LOCK_FILE = path.join(AUTH_DIR, ".bridge.lock");
 const SESSION_LINKED_FILE = path.join(AUTH_DIR, ".session-linked");
@@ -1127,7 +1129,7 @@ async function sendMediaToChat(chatId, media, caption) {
   });
 }
 
-/** Send PDF via in-page WWebJS — avoids broken contact getters in client.sendMessage. */
+/** Resolve chat + send PDF via addAndSendMsgToChat — skips WWebJS.sendMessage/link-preview getters. */
 async function sendDocumentRobust(chatId, filePath, filename, caption) {
   if (!client?.pupPage) throw new Error("WhatsApp not connected.");
   const media = MessageMedia.fromFilePath(filePath);
@@ -1140,24 +1142,106 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 
   const result = await client.pupPage.evaluate(
     async (targetChatId, payload, captionText) => {
-      const fail = (error) => ({ ok: false, error: String(error || "send failed") });
+      const fail = (error, code) => ({
+        ok: false,
+        error: String(error || "send failed"),
+        code: code || null,
+      });
+
+      const resolveChat = async (chatWid) => {
+        const collections = window.require("WAWebCollections");
+        let chat = collections.Chat.get(chatWid);
+        if (chat?.id) return chat;
+
+        try {
+          const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
+          if (found?.chat?.id) return found.chat;
+        } catch {
+          /* try next resolver */
+        }
+
+        try {
+          chat = await collections.Chat.find(chatWid);
+          if (chat?.id) return chat;
+        } catch {
+          /* try next resolver */
+        }
+
+        try {
+          const createChat = window.require("WAWebCreateChatAction");
+          if (createChat?.createChat) {
+            chat = await createChat.createChat(chatWid, "createChat");
+            if (chat?.id) return chat;
+          }
+        } catch {
+          /* no create API on this WA Web build */
+        }
+
+        return null;
+      };
+
       try {
         const widFactory = window.require("WAWebWidFactory");
         const chatWid = widFactory.createWid(targetChatId);
-        let chat = window.require("WAWebCollections").Chat.get(chatWid);
-        if (!chat) {
-          const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
-          chat = found?.chat;
+        const chat = await resolveChat(chatWid);
+        if (!chat?.id) {
+          return fail("Could not open WhatsApp chat for this number.", "NO_CHAT");
         }
-        if (!chat) return fail("Could not open WhatsApp chat for this number.");
 
-        const msg = await window.WWebJS.sendMessage(chat, "", {
-          media: payload,
-          caption: captionText || "",
-          sendMediaAsDocument: true,
-          linkPreview: false,
+        const mediaOptions = await window.WWebJS.processMediaData(payload, {
+          forceDocument: true,
         });
-        return msg ? { ok: true } : fail("WhatsApp rejected the PDF send.");
+        mediaOptions.caption = captionText || "";
+
+        const { getMaybeMeLidUser, getMaybeMePnUser } = window.require("WAWebUserPrefsMeUser");
+        const meUser = getMaybeMePnUser();
+        const lidUser = getMaybeMeLidUser();
+        let from = meUser;
+        try {
+          if (typeof chat.id?.isLid === "function" && chat.id.isLid()) {
+            from = lidUser || meUser;
+          }
+        } catch {
+          from = meUser;
+        }
+
+        const newId = await window.require("WAWebMsgKey").newId();
+        const newMsgKey = new (window.require("WAWebMsgKey"))({
+          from,
+          to: chat.id,
+          id: newId,
+          selfDir: "out",
+        });
+
+        let ephemeralFields = {};
+        try {
+          ephemeralFields =
+            window.require("WAWebGetEphemeralFieldsMsgActionsUtils").getEphemeralFields(chat) || {};
+        } catch {
+          ephemeralFields = {};
+        }
+
+        const message = {
+          id: newMsgKey,
+          ack: 0,
+          body: mediaOptions.preview || "",
+          from,
+          to: chat.id,
+          local: true,
+          self: "out",
+          t: parseInt(String(Date.now() / 1000), 10),
+          isNewMsg: true,
+          type: "document",
+          ...ephemeralFields,
+          ...mediaOptions,
+          ...(typeof mediaOptions.toJSON === "function" ? mediaOptions.toJSON() : {}),
+        };
+
+        const [msgPromise] = window
+          .require("WAWebSendMsgChatAction")
+          .addAndSendMsgToChat(chat, message);
+        await msgPromise;
+        return { ok: true };
       } catch (err) {
         return fail(err?.message || err);
       }
@@ -1169,42 +1253,53 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 
   if (result?.ok) return true;
   const err = new Error(result?.error || "Failed to send on WhatsApp.");
-  if (/not registered|could not open whatsapp chat/i.test(String(result?.error || ""))) {
+  if (result?.code === "NO_CHAT" || /not registered|could not open whatsapp chat/i.test(String(result?.error || ""))) {
     err.code = "NOT_ON_WHATSAPP";
+  }
+  if (isContactGetterError(err) || isLidError(err)) {
+    err.code = "CONTACT_GETTER";
   }
   throw err;
 }
 
+async function resolveBillSendTargets(digits) {
+  try {
+    return await resolveSendTargets(digits);
+  } catch (err) {
+    if (err?.code !== "NOT_ON_WHATSAPP") throw err;
+    const fallback = [`${digits}@c.us`, `${digits}@s.whatsapp.net`];
+    const registeredId = await lookupRegisteredChatId(digits);
+    if (registeredId && !registeredId.includes("@lid")) {
+      fallback.unshift(registeredId);
+    }
+    return [...new Set(fallback.filter(Boolean))];
+  }
+}
+
 async function performSend(digits, message, filePath, filename) {
   ensureWwebjs();
-  await quickSendCheck();
+  await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const caption = message || "";
-  const candidateChatIds = [];
-  const addChatId = (chatId) => {
-    if (chatId && !candidateChatIds.includes(chatId)) candidateChatIds.push(chatId);
-  };
-
-  addChatId(`${digits}@c.us`);
-  const registeredId = await lookupRegisteredChatId(digits);
-  addChatId(registeredId);
-  addChatId(`${digits}@s.whatsapp.net`);
+  const targets = await resolveBillSendTargets(digits);
 
   let lastErr = null;
-  for (const chatId of candidateChatIds) {
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (const chatId of targets) {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
+        if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
+        await ensureChatRegistered(chatId);
         await sendDocumentRobust(chatId, filePath, filename, caption);
         return;
       } catch (err) {
         lastErr = err;
         if (err?.code === "NOT_ON_WHATSAPP") break;
-        if (isContactGetterError(err) || isLidError(err)) break;
-        if (isCommsError(err) && attempt < 2) {
-          await sleep(1500);
+        if (err?.code === "CONTACT_GETTER" || isContactGetterError(err) || isLidError(err)) break;
+        if (isCommsError(err) && attempt < 3) {
+          await sleep(4000 * attempt);
           continue;
         }
-        if ((isSessionError(err) || isStoreError(err)) && attempt < 2) {
+        if ((isSessionError(err) || isStoreError(err)) && attempt < 3) {
           await sleep(2000);
           continue;
         }
@@ -1214,23 +1309,6 @@ async function performSend(digits, message, filePath, filename) {
 
   if (lastErr?.code === "NOT_ON_WHATSAPP") {
     throw lastErr;
-  }
-
-  try {
-    const media = MessageMedia.fromFilePath(filePath);
-    media.filename = filename || path.basename(filePath);
-    await sendMediaToChat(`${digits}@c.us`, media, caption);
-    return;
-  } catch (err) {
-    lastErr = err;
-  }
-
-  if (isContactGetterError(lastErr)) {
-    const err = new Error(
-      "WhatsApp contact sync error — click Reset Connection, scan QR again, then retry Send."
-    );
-    err.code = "CONTACT_GETTER";
-    throw err;
   }
 
   throw lastErr || new Error("Failed to send on WhatsApp.");

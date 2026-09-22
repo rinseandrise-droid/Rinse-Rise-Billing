@@ -15,9 +15,10 @@ if (!fs.existsSync(utilsPath)) {
 let src = fs.readFileSync(utilsPath, "utf8");
 const alreadyV1 = src.includes("PATCHED_CONTACT_GETTER_GUARD");
 const alreadyV2 = src.includes("PATCHED_CONTACT_GETTER_V2");
+const alreadyV3 = src.includes("PATCHED_SEND_MESSAGE_V3");
 
-if (alreadyV2) {
-  console.log("[patch-wwebjs] Already patched (v2)");
+if (alreadyV2 && alreadyV3) {
+  console.log("[patch-wwebjs] Already patched (v2 + v3)");
   process.exit(0);
 }
 
@@ -164,5 +165,88 @@ if (src.includes(unsafeContactMethods)) {
   console.warn("[patch-wwebjs] ContactMethods block not found — v2 patch skipped");
 }
 
+const unsafeSendMessageStart = `    window.WWebJS.sendMessage = async (chat, content, options = {}) => {
+        const { getIsNewsletter, getIsBroadcast } =
+            window.require('WAWebChatGetters');
+        const isChannel = getIsNewsletter(chat);
+        const isStatus = getIsBroadcast(chat);`;
+
+const safeSendMessageStart = `    window.WWebJS.sendMessage = async (chat, content, options = {}) => {
+        /* PATCHED_SEND_MESSAGE_V3 */
+        let isChannel = false;
+        let isStatus = false;
+        try {
+            const { getIsNewsletter, getIsBroadcast } =
+                window.require('WAWebChatGetters');
+            if (chat?.id) {
+                try {
+                    isChannel = getIsNewsletter(chat);
+                } catch {
+                    isChannel = false;
+                }
+                try {
+                    isStatus = getIsBroadcast(chat);
+                } catch {
+                    isStatus = false;
+                }
+            }
+        } catch {
+            isChannel = false;
+            isStatus = false;
+        }`;
+
+const unsafeLinkPreview = `        if (options.linkPreview) {
+            delete options.linkPreview;
+            const link = findLink(content);
+            if (link) {
+                let preview = await window
+                    .require('WAWebLinkPreviewChatAction')
+                    .getLinkPreview(link);
+                if (preview && preview.data) {
+                    preview = preview.data;
+                    preview.preview = true;
+                    preview.subtype = 'url';
+                    options = { ...options, ...preview };
+                }
+            }
+        }`;
+
+const safeLinkPreview = `        if (options.linkPreview) {
+            delete options.linkPreview;
+            try {
+                const link = findLink(content);
+                if (link) {
+                    let preview = await window
+                        .require('WAWebLinkPreviewChatAction')
+                        .getLinkPreview(link);
+                    if (preview && preview.data) {
+                        preview = preview.data;
+                        preview.preview = true;
+                        preview.subtype = 'url';
+                        options = { ...options, ...preview };
+                    }
+                }
+            } catch {
+                /* skip broken link preview on newer WA Web */
+            }
+        }`;
+
+if (!alreadyV3) {
+  if (src.includes(unsafeSendMessageStart)) {
+    src = src.replace(unsafeSendMessageStart, safeSendMessageStart);
+  } else if (!src.includes("PATCHED_SEND_MESSAGE_V3")) {
+    console.warn("[patch-wwebjs] sendMessage block not found — v3 patch skipped");
+  }
+
+  if (src.includes(unsafeLinkPreview)) {
+    src = src.replace(unsafeLinkPreview, safeLinkPreview);
+  } else if (!src.includes("PATCHED_SEND_MESSAGE_V3")) {
+    console.warn("[patch-wwebjs] linkPreview block not found — v3 patch skipped");
+  }
+}
+
 fs.writeFileSync(utilsPath, src, "utf8");
-console.log("[patch-wwebjs] Patched contact getters in Utils.js (v2)");
+const parts = [];
+if (src.includes("PATCHED_CONTACT_GETTER_V2")) parts.push("v2");
+if (src.includes("PATCHED_SEND_MESSAGE_V3")) parts.push("v3");
+console.log(`[patch-wwebjs] Patched Utils.js (${parts.join(" + ") || "partial"})`);
