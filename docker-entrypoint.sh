@@ -48,7 +48,7 @@ start_proxy_background() {
   (
     cd /app/whatsapp-bridge
     while true; do
-      node proxy.js >> "$DATA/whatsapp-proxy.log" 2>&1
+      nohup node proxy.js >> "$DATA/whatsapp-proxy.log" 2>&1
       echo "WhatsApp proxy exited — restarting in 3s..."
       sleep 3
     done
@@ -85,7 +85,7 @@ start_bridge_background() {
       fi
 
       echo "Starting WhatsApp bridge on port ${BRIDGE_INTERNAL} (auth: $WA_AUTH)..."
-      WHATSAPP_BRIDGE_PORT="$BRIDGE_INTERNAL" node server.js >> "$DATA/whatsapp-bridge.log" 2>&1
+      WHATSAPP_BRIDGE_PORT="$BRIDGE_INTERNAL" nohup node server.js >> "$DATA/whatsapp-bridge.log" 2>&1
       echo "WhatsApp bridge exited — restarting in ${backoff}s..."
       sleep "$backoff"
       if [ "$backoff" -lt 60 ]; then

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -50,8 +51,10 @@ from rates import get_rates, save_rates
 from whatsapp_send import (
     bridge_health_snapshot,
     bridge_is_running,
+    ensure_hosted_whatsapp_stack,
     get_bridge_status,
     get_or_create_invoice_pdf,
+    get_whatsapp_diagnostics,
     is_cloud_deployment,
     reset_bridge_session,
     send_bill_via_whatsapp,
@@ -360,9 +363,18 @@ def api_whatsapp_start():
     if not whatsapp_enabled():
         return jsonify({"ok": False, "error": "WhatsApp is disabled on this server.", "enabled": False})
     wait = 45 if is_cloud_deployment() else 10
-    started = try_start_bridge(wait_seconds=wait)
+    started = (
+        ensure_hosted_whatsapp_stack(wait_seconds=wait)
+        if is_cloud_deployment()
+        else try_start_bridge(wait_seconds=wait)
+    )
     status = get_bridge_status()
     return jsonify({"ok": started or status.get("available"), **status})
+
+
+@app.route("/api/whatsapp/diagnostics")
+def api_whatsapp_diagnostics():
+    return jsonify(get_whatsapp_diagnostics())
 
 
 @app.route("/api/whatsapp/reset", methods=["POST"])
@@ -527,3 +539,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"Open http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+def _kickoff_hosted_whatsapp() -> None:
+    if is_cloud_deployment() and whatsapp_enabled():
+        ensure_hosted_whatsapp_stack(wait_seconds=25)
+
+
+threading.Thread(target=_kickoff_hosted_whatsapp, daemon=True).start()

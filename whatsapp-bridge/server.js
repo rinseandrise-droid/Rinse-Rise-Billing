@@ -639,7 +639,6 @@ function createClient() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
-      "--no-zygote",
       "--mute-audio",
       "--disable-extensions",
       "--disable-background-networking",
@@ -652,9 +651,6 @@ function createClient() {
       "--window-size=1280,720",
     ],
   };
-  if (IS_HOSTED) {
-    puppeteerConfig.args.push("--single-process");
-  }
   const chromePath = getChromePath();
   if (chromePath) {
     puppeteerConfig.executablePath = chromePath;

@@ -6,11 +6,17 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # Windows local dev
+    fcntl = None  # type: ignore[assignment]
 
 from invoice_pdf import build_whatsapp_message, generate_invoice_pdf, invoice_filename
 
@@ -19,6 +25,9 @@ BRIDGE_DIR = ROOT / "whatsapp-bridge"
 BRIDGE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:3001").rstrip("/")
 BRIDGE_TIMEOUT = 60
 BRIDGE_SEND_TIMEOUT = int(os.environ.get("WHATSAPP_SEND_TIMEOUT", "120"))
+BRIDGE_PUBLIC_PORT = os.environ.get("WHATSAPP_BRIDGE_PORT", "3001")
+BRIDGE_INTERNAL_PORT = os.environ.get("WHATSAPP_BRIDGE_INTERNAL_PORT", "3002")
+_spawn_lock = threading.Lock()
 
 
 def _bridge_status_timeout() -> int:
@@ -33,15 +42,137 @@ def whatsapp_enabled() -> bool:
     return os.environ.get("WHATSAPP_ENABLED", "1") not in ("0", "false", "False", "no")
 
 
-def bridge_is_running(*, timeout: int | None = None) -> bool:
+def _bridge_health_at(base_url: str, *, timeout: int = 2) -> bool:
     try:
-        req = urllib.request.Request(f"{BRIDGE_URL}/health", method="GET")
-        if timeout is None:
-            timeout = 5 if is_cloud_deployment() else 2
+        req = urllib.request.Request(f"{base_url.rstrip('/')}/health", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
+
+
+def bridge_is_running(*, timeout: int | None = None) -> bool:
+    if timeout is None:
+        timeout = 5 if is_cloud_deployment() else 2
+    return _bridge_health_at(BRIDGE_URL, timeout=timeout)
+
+
+def internal_bridge_is_running(*, timeout: int = 2) -> bool:
+    return _bridge_health_at(f"http://127.0.0.1:{BRIDGE_INTERNAL_PORT}", timeout=timeout)
+
+
+def _node_executable() -> str:
+    for candidate in (shutil.which("node"), "/usr/bin/node", "/usr/local/bin/node"):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def _spawn_node_process(script: Path, *, env: dict[str, str], log_name: str) -> bool:
+    node = _node_executable()
+    if not node or not script.is_file():
+        return False
+    from paths import data_dir
+
+    log_dir = data_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / log_name
+    try:
+        log_file = open(log_path, "a", encoding="utf-8")
+        subprocess.Popen(
+            [node, script.name],
+            cwd=str(BRIDGE_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def ensure_hosted_whatsapp_stack(*, wait_seconds: float = 0) -> bool:
+    """Start proxy + bridge inside the Railway container when entrypoint background jobs did not."""
+    if not is_cloud_deployment() or not whatsapp_enabled():
+        return bridge_is_running()
+
+    if bridge_is_running(timeout=2):
+        return True
+
+    with _spawn_lock:
+        if bridge_is_running(timeout=2):
+            return True
+
+        from paths import data_dir, whatsapp_auth_dir, whatsapp_cache_dir
+
+        stack_lock = data_dir() / ".bridge-stack.lock"
+        stack_lock.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = None
+        try:
+            lock_handle = open(stack_lock, "a+", encoding="utf-8")
+            if fcntl is not None:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if wait_seconds > 0:
+                        deadline = time.monotonic() + wait_seconds
+                        while time.monotonic() < deadline:
+                            if bridge_is_running(timeout=2):
+                                return True
+                            time.sleep(1)
+                    return bridge_is_running(timeout=2)
+
+            if bridge_is_running(timeout=2):
+                return True
+
+            env_base = os.environ.copy()
+            env_base.setdefault("RAILWAY_ENVIRONMENT", "1")
+            env_base.setdefault("NODE_OPTIONS", "--max-old-space-size=1024")
+            env_base.setdefault("WHATSAPP_AUTH_DIR", str(whatsapp_auth_dir()))
+            env_base.setdefault("WHATSAPP_CACHE_DIR", str(whatsapp_cache_dir()))
+            env_base.setdefault("DATA_DIR", str(data_dir()))
+            env_base.setdefault("PUPPETEER_EXECUTABLE_PATH", "/usr/bin/chromium")
+            env_base.setdefault("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "true")
+
+            proxy_script = BRIDGE_DIR / "proxy.js"
+            server_script = BRIDGE_DIR / "server.js"
+            node_modules = BRIDGE_DIR / "node_modules"
+            if not node_modules.is_dir():
+                return False
+
+            if not bridge_is_running(timeout=1) and proxy_script.is_file():
+                proxy_env = {
+                    **env_base,
+                    "WHATSAPP_BRIDGE_PORT": BRIDGE_PUBLIC_PORT,
+                    "WHATSAPP_BRIDGE_INTERNAL_PORT": BRIDGE_INTERNAL_PORT,
+                }
+                _spawn_node_process(proxy_script, env=proxy_env, log_name="whatsapp-proxy.log")
+                time.sleep(0.5)
+
+            if not internal_bridge_is_running(timeout=1) and server_script.is_file():
+                bridge_env = {**env_base, "WHATSAPP_BRIDGE_PORT": BRIDGE_INTERNAL_PORT}
+                _spawn_node_process(server_script, env=bridge_env, log_name="whatsapp-bridge.log")
+
+            lock_handle.write(f"started={time.time()}\n")
+            lock_handle.flush()
+        finally:
+            if lock_handle is not None and fcntl is not None:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_handle.close()
+
+    if wait_seconds <= 0:
+        return bridge_is_running(timeout=2)
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if bridge_is_running(timeout=2):
+            return True
+        time.sleep(1)
+    return bridge_is_running(timeout=2)
 
 
 def bridge_health_snapshot(*, timeout: int = 2) -> dict[str, Any]:
@@ -67,13 +198,7 @@ def try_start_bridge(*, wait_seconds: float = 0) -> bool:
         return True
 
     if is_cloud_deployment():
-        if wait_seconds > 0:
-            deadline = time.monotonic() + wait_seconds
-            while time.monotonic() < deadline:
-                if bridge_is_running():
-                    return True
-                time.sleep(1)
-        return bridge_is_running()
+        return ensure_hosted_whatsapp_stack(wait_seconds=wait_seconds)
 
     node_exe = shutil.which("node")
     server_js = BRIDGE_DIR / "server.js"
@@ -158,9 +283,10 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
             "enabled": False,
         }
 
-    if auto_start and not bridge_is_running():
-        wait = 60 if hosted else 10
-        try_start_bridge(wait_seconds=wait)
+    if hosted:
+        ensure_hosted_whatsapp_stack(wait_seconds=20 if auto_start else 0)
+    elif auto_start and not bridge_is_running():
+        try_start_bridge(wait_seconds=10)
 
     try:
         status = _bridge_request("/status", timeout=_bridge_status_timeout())
@@ -209,11 +335,19 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
         auth_dir = whatsapp_auth_dir()
         session_linked = (auth_dir / ".session-linked").is_file()
         log_tail = read_bridge_log_tail() if hosted else ""
+        proxy_tail = read_proxy_log_tail() if hosted else ""
+        combined_log = "\n".join(part for part in (proxy_tail, log_tail) if part)
         bridge_hint = "Starting WhatsApp scanner — QR will appear in a few seconds."
-        if "initialize() failed" in log_tail or "Init failed" in log_tail:
+        if "EADDRINUSE" in combined_log:
+            bridge_hint = "Scanner port busy — click Reset Connection, wait 20 seconds, then retry."
+        elif "initialize() failed" in combined_log or "Init failed" in combined_log:
             bridge_hint = "Scanner failed to start — click Reset Connection, then scan the QR."
-        elif "Chrome binary missing" in log_tail or "could not find Chrome" in log_tail:
+        elif "Chrome binary missing" in combined_log or "could not find Chrome" in combined_log:
             bridge_hint = "Scanner could not find Chrome — redeploy the billing app on Railway."
+        elif "Cannot find module" in combined_log:
+            bridge_hint = "Scanner dependencies missing on server — redeploy the billing app on Railway."
+        elif hosted and not _node_executable():
+            bridge_hint = "Node.js missing in container — redeploy the billing app on Railway."
         return {
             "available": False,
             "ready": False,
@@ -223,10 +357,32 @@ def get_bridge_status(*, auto_start: bool = False) -> dict[str, Any]:
             "sessionLinked": session_linked,
             "sessionRestoring": False if hosted else session_linked,
             "sessionLocked": session_linked,
-            "bridgeLogTail": log_tail[-1200:] if log_tail else None,
+            "bridgeLogTail": combined_log[-1200:] if combined_log else None,
             "hosted": hosted,
             "enabled": True,
         }
+
+
+def get_whatsapp_diagnostics() -> dict[str, Any]:
+    from paths import data_dir
+
+    proxy_tail = read_proxy_log_tail()
+    bridge_tail = read_bridge_log_tail()
+    return {
+        "enabled": whatsapp_enabled(),
+        "hosted": is_cloud_deployment(),
+        "bridgeUrl": BRIDGE_URL,
+        "publicPort": BRIDGE_PUBLIC_PORT,
+        "internalPort": BRIDGE_INTERNAL_PORT,
+        "publicHealth": bridge_is_running(timeout=3),
+        "internalHealth": internal_bridge_is_running(timeout=3),
+        "node": _node_executable() or None,
+        "bridgeDirExists": BRIDGE_DIR.is_dir(),
+        "nodeModulesExists": (BRIDGE_DIR / "node_modules").is_dir(),
+        "proxyLogTail": proxy_tail[-800:] if proxy_tail else None,
+        "bridgeLogTail": bridge_tail[-800:] if bridge_tail else None,
+        "dataDir": str(data_dir()),
+    }
 
 
 def _clear_local_whatsapp_session() -> None:
@@ -257,6 +413,19 @@ def read_bridge_log_tail(*, max_lines: int = 40) -> str:
     from paths import data_dir
 
     log_path = data_dir() / "whatsapp-bridge.log"
+    if not log_path.is_file():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-max_lines:])
+    except OSError:
+        return ""
+
+
+def read_proxy_log_tail(*, max_lines: int = 30) -> str:
+    from paths import data_dir
+
+    log_path = data_dir() / "whatsapp-proxy.log"
     if not log_path.is_file():
         return ""
     try:
