@@ -740,7 +740,7 @@ function isWhatsAppSendBusyError(message) {
 
 let whatsAppSendInFlight = false;
 
-async function sendBillWhatsAppWithRetry(billId, options = {}, attempts = 5) {
+async function sendBillWhatsAppWithRetry(billId, options = {}, attempts = 8) {
   if (whatsAppSendInFlight) {
     throw new Error("WhatsApp is already sending another invoice — please wait a few seconds.");
   }
@@ -752,12 +752,13 @@ async function sendBillWhatsAppWithRetry(billId, options = {}, attempts = 5) {
         return await API.sendBillWhatsApp(billId, options);
       } catch (err) {
         lastError = err;
-        if (
-          (isWhatsAppSendBusyError(err.message) ||
-            /timed out|still connecting|still loading|wait 10 seconds/i.test(err.message || "")) &&
-          attempt < attempts - 1
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 4000 + attempt * 1500));
+        const retryable =
+          isWhatsAppSendBusyError(err.message) ||
+          /timed out|still connecting|still loading|wait 10 seconds|finishing the previous send|try again/i.test(
+            err.message || ""
+          );
+        if (retryable && attempt < attempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 3000 + attempt * 2000));
           continue;
         }
         throw err;
@@ -2989,7 +2990,9 @@ async function shareBillOnWhatsApp(phone, bill, { skipPaymentValidation = false 
       startPendingWhatsAppWatcher(bill.id);
       return false;
     }
-    await downloadBillInvoicePdf(bill);
+    if (!isWhatsAppSendBusyError(result.error)) {
+      await downloadBillInvoicePdf(bill);
+    }
     throw new Error(result.error);
   }
 

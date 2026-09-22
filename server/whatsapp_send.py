@@ -562,7 +562,7 @@ def send_bill_via_whatsapp(bill: dict[str, Any]) -> dict[str, Any]:
                 last_error = body or str(exc)
                 needs_reconnect = "detached frame" in last_error.lower()
             if exc.code in (429, 503) and attempt < 3:
-                time.sleep(max(2, min(retry_after, 6)))
+                time.sleep(max(3, min(retry_after, 12)))
                 continue
             break
         except (urllib.error.URLError, TimeoutError) as exc:
