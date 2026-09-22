@@ -84,8 +84,8 @@ let client = null;
 let recovering = false;
 let sendInProgress = false;
 let sendInProgressSince = 0;
-const SEND_LOCK_MAX_MS = Number(process.env.WHATSAPP_SEND_LOCK_MS || 45000);
-const SEND_OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || (IS_HOSTED ? 55000 : 45000));
+const SEND_LOCK_MAX_MS = Number(process.env.WHATSAPP_SEND_LOCK_MS || (IS_HOSTED ? 130000 : 90000));
+const SEND_OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || (IS_HOSTED ? 120000 : 90000));
 const SEND_LOCK_FORCE_CLEAR_MS = Number(process.env.WHATSAPP_SEND_FORCE_CLEAR_MS || 25000);
 const GET_NUMBER_ID_TIMEOUT_MS = Number(
   process.env.WHATSAPP_NUMBER_LOOKUP_MS || (IS_HOSTED ? 12000 : 5000)
@@ -1205,6 +1205,78 @@ async function sendMediaToChat(chatId, media, caption) {
   });
 }
 
+async function waitForMessageAck(msgId, timeoutMs = 25000) {
+  if (!client?.pupPage || !msgId) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ack = await client.pupPage.evaluate((id) => {
+      const msg = window.require("WAWebCollections").Msg.get(id);
+      return typeof msg?.ack === "number" ? msg.ack : -1;
+    }, msgId);
+    if (ack >= 1) return true;
+    if (ack < 0) break;
+    await sleep(750);
+  }
+  return false;
+}
+
+async function verifyRecentDocumentInChat(chatId, filename, msgId, sentAfterSec, timeoutMs = 20000) {
+  if (!client?.pupPage) return false;
+  const needle = String(filename || "").toLowerCase();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await client.pupPage.evaluate(
+      (targetChatId, targetFilename, expectedMsgId, minTimestamp) => {
+        const chat = window.require("WAWebCollections").Chat.get(
+          window.require("WAWebWidFactory").createWid(targetChatId)
+        );
+        if (!chat?.msgs?.getModelsArray) return false;
+        const recent = chat.msgs.getModelsArray().slice(-8).reverse();
+        const nowSec = Math.floor(Date.now() / 1000);
+        for (const msg of recent) {
+          if (!msg?.fromMe) continue;
+          if (expectedMsgId && msg.id?._serialized !== expectedMsgId) continue;
+          const type = msg.type || msg.kind;
+          if (type !== "document") continue;
+          const msgTime = Number(msg.t || 0);
+          if (minTimestamp && msgTime < minTimestamp) continue;
+          if (nowSec - msgTime > 120) continue;
+          const name = String(msg.filename || msg._data?.filename || "").toLowerCase();
+          const ack = typeof msg.ack === "number" ? msg.ack : 0;
+          if (
+            ack >= 1 &&
+            (!targetFilename || name.includes(String(targetFilename).replace(".pdf", "")))
+          ) {
+            return true;
+          }
+        }
+        return false;
+      },
+      chatId,
+      needle,
+      msgId || "",
+      sentAfterSec || 0
+    );
+    if (found) return true;
+    await sleep(1000);
+  }
+  return false;
+}
+
+async function confirmPdfDelivered(chatId, filename, msgId, sentAfterSec) {
+  if (msgId && (await waitForMessageAck(msgId, 30000))) {
+    return true;
+  }
+  if (await verifyRecentDocumentInChat(chatId, filename, msgId, sentAfterSec, 25000)) {
+    return true;
+  }
+  const err = new Error(
+    "WhatsApp did not confirm the invoice PDF was delivered. Please try Send again."
+  );
+  err.code = "SEND_NOT_CONFIRMED";
+  throw err;
+}
+
 /** Resolve chat + send PDF via addAndSendMsgToChat — skips WWebJS.sendMessage/link-preview getters. */
 async function sendDocumentRobust(chatId, filePath, filename, caption) {
   if (!client?.pupPage) throw new Error("WhatsApp not connected.");
@@ -1256,6 +1328,17 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         if (String(targetChatId).includes("@lid")) {
           return fail("Invalid chat target for phone send.", "NO_CHAT");
         }
+        const phoneWid = window.require("WAWebWidFactory").createWid(targetChatId);
+        let exists = null;
+        try {
+          exists = await window.require("WAWebQueryExistsJob").queryWidExists(phoneWid);
+        } catch {
+          exists = null;
+        }
+        if (!exists?.wid) {
+          return fail("This phone number is not registered on WhatsApp.", "NO_CHAT");
+        }
+
         const chat = await resolveChat(targetChatId);
         if (!chat?.id) {
           return fail("Could not open WhatsApp chat for this number.", "NO_CHAT");
@@ -1266,17 +1349,12 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         });
         mediaOptions.caption = captionText || "";
 
-        const { getMaybeMeLidUser, getMaybeMePnUser } = window.require("WAWebUserPrefsMeUser");
+        const { getMaybeMePnUser } = window.require("WAWebUserPrefsMeUser");
         const meUser = getMaybeMePnUser();
-        const lidUser = getMaybeMeLidUser();
-        let from = meUser;
-        try {
-          if (typeof chat.id?.isLid === "function" && chat.id.isLid()) {
-            from = lidUser || meUser;
-          }
-        } catch {
-          from = meUser;
+        if (!meUser) {
+          return fail("WhatsApp sender is not ready yet — wait a few seconds and retry.", "NOT_READY");
         }
+        const from = meUser;
 
         const newId = await window.require("WAWebMsgKey").newId();
         const newMsgKey = new (window.require("WAWebMsgKey"))({
@@ -1310,11 +1388,14 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           ...(typeof mediaOptions.toJSON === "function" ? mediaOptions.toJSON() : {}),
         };
 
-        const [msgPromise] = window
+        const [msgPromise, sendMsgResultPromise] = window
           .require("WAWebSendMsgChatAction")
           .addAndSendMsgToChat(chat, message);
         await msgPromise;
-        return { ok: true };
+        await sendMsgResultPromise;
+        const msgId = newMsgKey._serialized;
+        const ack = window.require("WAWebCollections").Msg.get(msgId)?.ack ?? 0;
+        return { ok: true, msgId, ack };
       } catch (err) {
         return fail(err?.message || err);
       }
@@ -1324,8 +1405,20 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
     caption || ""
   );
 
-  if (result?.ok) return true;
+  if (result?.ok) {
+    const sentAfterSec = Math.floor(Date.now() / 1000) - 5;
+    await confirmPdfDelivered(
+      chatId,
+      filename || path.basename(filePath),
+      result.msgId,
+      sentAfterSec
+    );
+    return true;
+  }
   const err = new Error(result?.error || "Failed to send on WhatsApp.");
+  if (result?.code === "NOT_READY") {
+    err.code = "COMMS_NOT_READY";
+  }
   if (result?.code === "NO_CHAT" || /not registered|could not open whatsapp chat/i.test(String(result?.error || ""))) {
     err.code = "NOT_ON_WHATSAPP";
   }
@@ -1336,17 +1429,27 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 }
 
 async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
+  const sentAfterSec = Math.floor(Date.now() / 1000) - 2;
   try {
-    await client.sendMessage(chatId, media, {
-      caption: caption || "",
-      sendSeen: false,
-      sendMediaAsDocument: true,
-      linkPreview: false,
-    });
-  } catch (err) {
-    if (!isContactGetterError(err) && !isLidError(err)) throw err;
     await sendDocumentRobust(chatId, filePath, filename, caption || "");
+    return;
+  } catch (robustErr) {
+    console.warn("[WhatsApp] Direct PDF send failed, trying library send:", robustErr.message);
+    if (robustErr?.code === "NOT_ON_WHATSAPP") throw robustErr;
   }
+
+  const msg = await client.sendMessage(chatId, media, {
+    caption: caption || "",
+    sendSeen: false,
+    sendMediaAsDocument: true,
+    linkPreview: false,
+    waitUntilMsgSent: true,
+  });
+  const msgId = msg?.id?._serialized || null;
+  if (!msgId) {
+    throw new Error("WhatsApp did not accept the PDF message.");
+  }
+  await confirmPdfDelivered(chatId, filename, msgId, sentAfterSec);
 }
 
 function captionForPdfSend(message) {
@@ -1361,6 +1464,20 @@ async function performSend(digits, message, filePath, filename) {
   ensureWwebjs();
   await applyWhatsAppPagePatches();
   await assertSendReady({ maxCommsWaitMs: 8000 });
+
+  try {
+    const registered = await client.isRegisteredUser(`${digits}@c.us`);
+    if (!registered) {
+      const err = new Error(
+        `Phone number ${digits.slice(-10)} is not registered on WhatsApp.`
+      );
+      err.code = "NOT_ON_WHATSAPP";
+      throw err;
+    }
+  } catch (err) {
+    if (err?.code === "NOT_ON_WHATSAPP") throw err;
+    console.warn("[WhatsApp] Could not verify number on WhatsApp — trying send anyway:", err.message);
+  }
 
   const fullCaption = String(message || "");
   const pdfCaption = captionForPdfSend(fullCaption);
@@ -1689,7 +1806,8 @@ app.post("/send", async (req, res) => {
   try {
     try {
       await withSendTimeout(performSend(digits, message, filePath, filename), "bill send");
-      return res.json({ ok: true });
+      console.log(`[WhatsApp] Bill send verified for ${digits.slice(-10)}`);
+      return res.json({ ok: true, verified: true });
     } catch (err) {
       if (err.code === "NOT_ON_WHATSAPP") {
         return res.status(400).json({ error: err.message });
@@ -1722,6 +1840,14 @@ app.post("/send", async (req, res) => {
           error:
             "WhatsApp is still connecting on the server. Wait about 1 minute, then try Send on WhatsApp again.",
           needsReconnect: true,
+        });
+      }
+
+      if (err.code === "SEND_NOT_CONFIRMED") {
+        return res.status(503).json({
+          error: err.message,
+          needsReconnect: false,
+          retryAfterSec: 8,
         });
       }
 

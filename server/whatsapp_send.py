@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BRIDGE_DIR = ROOT / "whatsapp-bridge"
 BRIDGE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:3001").rstrip("/")
 BRIDGE_TIMEOUT = 60
-BRIDGE_SEND_TIMEOUT = int(os.environ.get("WHATSAPP_SEND_TIMEOUT", "120"))
+BRIDGE_SEND_TIMEOUT = int(os.environ.get("WHATSAPP_SEND_TIMEOUT", "150"))
 BRIDGE_PUBLIC_PORT = os.environ.get("WHATSAPP_BRIDGE_PORT", "3001")
 BRIDGE_INTERNAL_PORT = os.environ.get("WHATSAPP_BRIDGE_INTERNAL_PORT", "3002")
 _spawn_lock = threading.Lock()
@@ -562,7 +562,7 @@ def send_bill_via_whatsapp(bill: dict[str, Any]) -> dict[str, Any]:
                 last_error = body or str(exc)
                 needs_reconnect = "detached frame" in last_error.lower()
             if exc.code in (429, 503) and attempt < 3:
-                time.sleep(max(3, min(retry_after, 12)))
+                time.sleep(max(5, min(retry_after, 15)))
                 continue
             break
         except (urllib.error.URLError, TimeoutError) as exc:

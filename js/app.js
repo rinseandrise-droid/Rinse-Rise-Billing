@@ -754,7 +754,7 @@ async function sendBillWhatsAppWithRetry(billId, options = {}, attempts = 8) {
         lastError = err;
         const retryable =
           isWhatsAppSendBusyError(err.message) ||
-          /timed out|still connecting|still loading|wait 10 seconds|finishing the previous send|try again/i.test(
+          /timed out|still connecting|still loading|wait 10 seconds|finishing the previous send|did not confirm|try again/i.test(
             err.message || ""
           );
         if (retryable && attempt < attempts - 1) {
