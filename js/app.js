@@ -2903,18 +2903,6 @@ function startPendingWhatsAppWatcher(billId) {
   }, 2000);
 }
 
-async function downloadBillInvoicePdf(bill) {
-  let blob;
-  let filename;
-  try {
-    ({ blob, filename } = await API.fetchBillInvoicePdf(bill.id));
-  } catch {
-    ({ blob, filename } = await InvoicePdf.generate(bill));
-  }
-  InvoicePdf.triggerDownload(blob, filename);
-  return filename;
-}
-
 function showWhatsAppToast(html, durationMs = 7000) {
   const toast = $("#whatsappToast");
   if (!toast) return;
@@ -2989,9 +2977,6 @@ async function shareBillOnWhatsApp(phone, bill, { skipPaymentValidation = false 
       }
       startPendingWhatsAppWatcher(bill.id);
       return false;
-    }
-    if (!isWhatsAppSendBusyError(result.error)) {
-      await downloadBillInvoicePdf(bill);
     }
     throw new Error(result.error);
   }

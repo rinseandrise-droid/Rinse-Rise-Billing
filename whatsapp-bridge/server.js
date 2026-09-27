@@ -1100,31 +1100,25 @@ async function applyWhatsAppPagePatches() {
   try {
     await client.pupPage.evaluate(() => {
       try {
-        const gating = window.require("WAWebLid1X1MigrationGating");
-        if (gating?.Lid1X1MigrationUtils) {
-          gating.Lid1X1MigrationUtils.isLidMigrated = () => false;
-        }
-      } catch {
-        /* module layout differs on some WA Web builds */
-      }
-      try {
         const utils = window.require("WAWebLidMigrationUtils");
-        if (typeof utils?.toUserLid === "function") {
+        if (typeof utils?.toUserLid === "function" && !utils.toUserLid.__rinsePatched) {
           const original = utils.toUserLid.bind(utils);
-          utils.toUserLid = (wid) => {
+          const wrapped = (wid) => {
             try {
               return original(wid);
             } catch {
               return wid;
             }
           };
+          wrapped.__rinsePatched = true;
+          utils.toUserLid = wrapped;
         }
       } catch {
-        /* optional */
+        /* optional on this WhatsApp Web build */
       }
     });
     pagePatchesApplied = true;
-    console.log("[WhatsApp] Applied in-page LID migration patches.");
+    console.log("[WhatsApp] Applied in-page send patches.");
   } catch (err) {
     console.warn("[WhatsApp] Page patches failed:", err.message);
   }
@@ -1310,8 +1304,16 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         code: code || null,
       });
 
+      const widText = (wid) => {
+        if (!wid) return null;
+        if (typeof wid === "string") return wid;
+        if (wid._serialized) return wid._serialized;
+        if (wid.user && wid.server) return `${wid.user}@${wid.server}`;
+        return null;
+      };
+
       const resolveChat = async (targetId) => {
-        if (String(targetId).includes("@lid")) return null;
+        if (!targetId) return null;
 
         try {
           const chat = await window.WWebJS.getChat(targetId, { getAsModel: false });
@@ -1320,7 +1322,12 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           /* try create/find */
         }
 
-        const chatWid = window.require("WAWebWidFactory").createWid(targetId);
+        let chatWid = null;
+        try {
+          chatWid = window.require("WAWebWidFactory").createWid(targetId);
+        } catch {
+          return null;
+        }
         try {
           const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
           if (found?.chat?.id) return found.chat;
@@ -1338,22 +1345,54 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         return null;
       };
 
-      try {
-        if (String(targetChatId).includes("@lid")) {
-          return fail("Invalid chat target for phone send.", "NO_CHAT");
-        }
-        const phoneWid = window.require("WAWebWidFactory").createWid(targetChatId);
-        let exists = null;
+      const senderForChat = (chat) => {
+        const prefs = window.require("WAWebUserPrefsMeUser");
+        const lidUser = typeof prefs.getMaybeMeLidUser === "function" ? prefs.getMaybeMeLidUser() : null;
+        const meUser = typeof prefs.getMaybeMePnUser === "function" ? prefs.getMaybeMePnUser() : null;
+        const serialized = widText(chat?.id) || "";
+        const chatIsLid =
+          (typeof chat?.id?.isLid === "function" && chat.id.isLid()) || serialized.includes("@lid");
+        return chatIsLid ? lidUser || meUser : meUser || lidUser;
+      };
+
+      const destinationIds = async () => {
+        const ids = [];
+        const push = (wid) => {
+          const text = widText(wid);
+          if (text && !ids.includes(text)) ids.push(text);
+        };
         try {
-          exists = await window.require("WAWebQueryExistsJob").queryWidExists(phoneWid);
+          if (window.WWebJS?.enforceLidAndPnRetrieval) {
+            const pair = await window.WWebJS.enforceLidAndPnRetrieval(targetChatId);
+            push(pair?.lid);
+            push(pair?.phone);
+          }
         } catch {
-          exists = null;
+          /* phone id is still a valid target */
         }
-        if (!exists?.wid) {
+        try {
+          const phoneWid = window.require("WAWebWidFactory").createWid(targetChatId);
+          const exists = await window.require("WAWebQueryExistsJob").queryWidExists(phoneWid);
+          if (exists?.wid) push(exists.wid);
+          else if (ids.length === 0) return { ids, missing: true };
+        } catch {
+          /* lookup crashed; still try the number we were given */
+        }
+        push(targetChatId);
+        return { ids, missing: false };
+      };
+
+      try {
+        const lookedUp = await destinationIds();
+        if (lookedUp.missing && lookedUp.ids.length === 0) {
           return fail("This phone number is not registered on WhatsApp.", "NO_CHAT");
         }
 
-        const chat = await resolveChat(targetChatId);
+        let chat = null;
+        for (const targetId of lookedUp.ids) {
+          chat = await resolveChat(targetId);
+          if (chat?.id) break;
+        }
         if (!chat?.id) {
           return fail("Could not open WhatsApp chat for this number.", "NO_CHAT");
         }
@@ -1363,12 +1402,10 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         });
         mediaOptions.caption = captionText || "";
 
-        const { getMaybeMePnUser } = window.require("WAWebUserPrefsMeUser");
-        const meUser = getMaybeMePnUser();
-        if (!meUser) {
+        const from = senderForChat(chat);
+        if (!from) {
           return fail("WhatsApp sender is not ready yet — wait a few seconds and retry.", "NOT_READY");
         }
-        const from = meUser;
 
         const newId = await window.require("WAWebMsgKey").newId();
         const newMsgKey = new (window.require("WAWebMsgKey"))({
@@ -1409,7 +1446,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         await sendMsgResultPromise;
         const msgId = newMsgKey._serialized;
         const ack = window.require("WAWebCollections").Msg.get(msgId)?.ack ?? 0;
-        return { ok: true, msgId, ack };
+        return { ok: true, msgId, ack, chatId: widText(chat.id) };
       } catch (err) {
         return fail(err?.message || err);
       }
@@ -1420,9 +1457,10 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   );
 
   if (result?.ok) {
+    if (Number(result.ack) >= 1) return true;
     const sentAfterSec = Math.floor(Date.now() / 1000) - 5;
     await confirmPdfDelivered(
-      chatId,
+      result.chatId || chatId,
       filename || path.basename(filePath),
       result.msgId,
       sentAfterSec
@@ -1545,7 +1583,7 @@ async function performSend(digits, message, filePath, filename) {
 
   if (isContactGetterError(lastErr) || isLidError(lastErr)) {
     const err = new Error(
-      `Could not send invoice to ${digits.slice(-10)}. Confirm the mobile number is correct and on WhatsApp.`
+      "WhatsApp could not open this chat. Wait a few seconds and tap Send again."
     );
     err.code = "CONTACT_GETTER";
     throw err;
