@@ -1100,6 +1100,17 @@ async function applyWhatsAppPagePatches() {
   try {
     await client.pupPage.evaluate(() => {
       try {
+        const gating = window.require("WAWebLid1X1MigrationGating");
+        if (gating?.Lid1X1MigrationUtils) {
+          gating.Lid1X1MigrationUtils.isLidMigrated = () => false;
+        }
+        if (typeof gating?.shouldHaveAccountLid === "function") {
+          gating.shouldHaveAccountLid = () => false;
+        }
+      } catch {
+        /* this WhatsApp Web build uses a different module layout */
+      }
+      try {
         const utils = window.require("WAWebLidMigrationUtils");
         if (typeof utils?.toUserLid === "function" && !utils.toUserLid.__rinsePatched) {
           const original = utils.toUserLid.bind(utils);
@@ -1115,36 +1126,6 @@ async function applyWhatsAppPagePatches() {
         }
       } catch {
         /* optional on this WhatsApp Web build */
-      }
-
-      if (window.WWebJS?.getChat && !window.WWebJS.getChat.__rinseUnsaved) {
-        const originalGetChat = window.WWebJS.getChat.bind(window.WWebJS);
-        const wrappedGetChat = async (chatId, opts) => {
-          try {
-            const chat = await originalGetChat(chatId, opts);
-            if (chat?.id) return chat;
-          } catch {
-            /* unsaved numbers need a linked id from WhatsApp first */
-          }
-          try {
-            const raw = String(chatId || "");
-            if (!raw || raw.includes("@lid")) return null;
-            const phoneNumber = raw.split("@")[0];
-            const sync = window.require("WAWebContactSyncUtils");
-            if (typeof sync?.constructUsyncDeltaQuery !== "function") return null;
-            const query = sync.constructUsyncDeltaQuery([{ type: "add", phoneNumber }]);
-            const result = await query.execute();
-            const lid = result?.list?.[0]?.lid?._serialized || result?.list?.[0]?.lid;
-            if (!lid) return null;
-            const lidId = typeof lid === "string" ? lid : lid._serialized;
-            if (!lidId) return null;
-            return await originalGetChat(lidId, opts);
-          } catch {
-            return null;
-          }
-        };
-        wrappedGetChat.__rinseUnsaved = true;
-        window.WWebJS.getChat = wrappedGetChat;
       }
     });
     pagePatchesApplied = true;
@@ -1396,14 +1377,13 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 
       const resolveChat = async (targetId) => {
         if (!targetId) return null;
+        const phoneChat = await tryOpenChat(targetId);
+        if (phoneChat?.id) return phoneChat;
         if (!String(targetId).includes("@lid")) {
           const lid = await syncUnsavedNumber(targetId);
-          if (lid) {
-            const lidChat = await tryOpenChat(lid);
-            if (lidChat?.id) return lidChat;
-          }
+          if (lid) return tryOpenChat(lid);
         }
-        return tryOpenChat(targetId);
+        return null;
       };
 
       const senderForChat = (chat) => {
@@ -1523,15 +1503,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
     caption || ""
   );
 
-  if (result?.ok) {
-    if (Number(result.ack) >= 1) return true;
-    const sentAfterSec = Math.floor(Date.now() / 1000) - 5;
-    await confirmPdfDelivered(
-      result.chatId || chatId,
-      filename || path.basename(filePath),
-      result.msgId,
-      sentAfterSec
-    );
+  if (result?.ok && result.msgId) {
     return true;
   }
   const err = new Error(result?.error || "Failed to send on WhatsApp.");
@@ -1548,13 +1520,14 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 }
 
 async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
-  const sentAfterSec = Math.floor(Date.now() / 1000) - 2;
+  let directError = null;
   try {
     await sendDocumentRobust(chatId, filePath, filename, caption || "");
     return;
-  } catch (robustErr) {
-    console.warn("[WhatsApp] Direct PDF send failed, trying library send:", robustErr.message);
-    if (robustErr?.code === "NOT_ON_WHATSAPP") throw robustErr;
+  } catch (err) {
+    directError = err;
+    console.warn("[WhatsApp] Direct PDF send failed, trying library send:", err.message);
+    if (err?.code === "NOT_ON_WHATSAPP" || err?.code === "SEND_NOT_CONFIRMED") throw err;
   }
 
   const msg = await client.sendMessage(chatId, media, {
@@ -1566,9 +1539,8 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
   });
   const msgId = msg?.id?._serialized || null;
   if (!msgId) {
-    throw new Error("WhatsApp did not accept the PDF message.");
+    throw directError || new Error("WhatsApp did not accept the PDF message.");
   }
-  await confirmPdfDelivered(chatId, filename, msgId, sentAfterSec);
 }
 
 function captionForPdfSend(message) {
