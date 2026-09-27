@@ -51,7 +51,7 @@ const IS_HOSTED = Boolean(
  * often never fires on multi-device WA Web — we treat CONNECTED state as ready.
  */
 const WA_WEB_VERSION =
-  process.env.WHATSAPP_WEB_VERSION || "2.3000.1043441279-alpha";
+  process.env.WHATSAPP_WEB_VERSION || "2.3000.1048579041-alpha";
 const BUNDLED_CACHE_DIR = path.join(__dirname, "wa-cache");
 
 const AUTH_READY_TIMEOUT_MS = Number(
@@ -766,7 +766,7 @@ function bindClientEvents(waClient) {
     try {
       clearQrStartupWatchdog();
       state.qrGeneration += 1;
-      state.qr = await QRCode.toDataURL(qr, { margin: 1, width: 280, errorCorrectionLevel: "M" });
+      state.qr = await QRCode.toDataURL(qr, { margin: 2, width: 360, errorCorrectionLevel: "H" });
       console.log(`[WhatsApp] QR ready (#${state.qrGeneration}) — scan in billing app.`);
     } catch (err) {
       state.lastError = "Could not render QR code.";

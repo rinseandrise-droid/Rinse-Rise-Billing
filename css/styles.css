@@ -2108,7 +2108,7 @@ select:disabled {
 .wa-qr-wrap {
   display: flex;
   justify-content: center;
-  padding: 0.5rem 0;
+  padding: 16px;
   background: #fff;
   border-radius: 10px;
 }
@@ -2128,12 +2128,13 @@ select:disabled {
 
 .wa-qr-image {
   display: block;
-  width: min(280px, 100%);
+  width: min(320px, 100%);
   height: auto;
   margin: 0 auto;
-  border-radius: 8px;
-  border: 1px solid var(--gray-200);
+  border-radius: 0;
+  border: none;
   background: #fff;
+  image-rendering: pixelated;
 }
 
 .wa-connect-hint {
