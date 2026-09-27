@@ -3729,6 +3729,77 @@ select:disabled {
   grid-template-columns: 1fr 1.6fr;
 }
 
+.overall-monthly {
+  margin: 0 0 1.25rem;
+}
+
+.overall-monthly h4 {
+  margin: 0 0 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.overall-month-scroll {
+  overflow-x: auto;
+  border: 2px solid var(--cream-dark);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.overall-month-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 640px;
+}
+
+.overall-month-table th,
+.overall-month-table td {
+  padding: 0.7rem 0.85rem;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--cream-dark);
+}
+
+.overall-month-table th:first-child,
+.overall-month-table td:first-child {
+  text-align: left;
+}
+
+.overall-month-table th {
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--cream);
+}
+
+.overall-month-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.overall-month-table tr.is-current td {
+  background: #fff6f0;
+  font-weight: 700;
+}
+
+.overall-month-now {
+  display: inline-block;
+  margin-left: 0.45rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: var(--orange);
+  color: #fff;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
 .overall-footnote {
   text-align: center;
   font-size: 0.82rem;

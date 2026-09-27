@@ -4115,6 +4115,32 @@ async function showProfitLossReport() {
   }
 }
 
+function currentIstMonthKey() {
+  const day = toIstDateKey(new Date());
+  return day ? day.slice(0, 7) : "";
+}
+
+function formatMonthLabel(monthKey) {
+  const [year, month] = String(monthKey || "").split("-");
+  const index = Number(month) - 1;
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  if (!year || index < 0 || index > 11) return monthKey || "—";
+  return `${names[index]} ${year}`;
+}
+
+function emptyMonthBucket(monthKey) {
+  return {
+    month: monthKey,
+    label: formatMonthLabel(monthKey),
+    orders: 0,
+    revenue: 0,
+    discount: 0,
+    items: 0,
+    pendingOrders: 0,
+    doneOrders: 0,
+  };
+}
+
 function computeOverallStatsLocal() {
   const orders = getBillHistory();
   let totalRevenue = 0;
@@ -4125,20 +4151,37 @@ function computeOverallStatsLocal() {
   const serviceRevenue = {};
   const serviceItems = {};
   const sentVia = { saved: 0, print: 0, whatsapp: 0 };
+  const months = {};
+  const currentMonth = currentIstMonthKey();
+  if (currentMonth) months[currentMonth] = emptyMonthBucket(currentMonth);
 
   orders.forEach((bill) => {
     totalRevenue += bill.total || 0;
     totalDiscount += bill.discountAmount || 0;
-    if (getDeliveryStatus(bill) === "done") doneOrders += 1;
+    const done = getDeliveryStatus(bill) === "done";
+    if (done) doneOrders += 1;
     else pendingOrders += 1;
 
     const via =
       bill.sentVia === "whatsapp" ? "whatsapp" : bill.sentVia === "saved" ? "saved" : "print";
     sentVia[via] = (sentVia[via] || 0) + 1;
 
+    const day = toIstDateKey(bill.createdAt);
+    const monthKey = day ? day.slice(0, 7) : currentMonth;
+    if (monthKey && !months[monthKey]) months[monthKey] = emptyMonthBucket(monthKey);
+    const bucket = months[monthKey];
+    if (bucket) {
+      bucket.orders += 1;
+      bucket.revenue += bill.total || 0;
+      bucket.discount += bill.discountAmount || 0;
+      if (done) bucket.doneOrders += 1;
+      else bucket.pendingOrders += 1;
+    }
+
     bill.items?.forEach((item) => {
       const qty = item.qty || 0;
       totalItems += qty;
+      if (bucket) bucket.items += qty;
       const svc = item.service || "Other";
       const amount = (item.rate || 0) * qty;
       serviceRevenue[svc] = (serviceRevenue[svc] || 0) + amount;
@@ -4147,6 +4190,12 @@ function computeOverallStatsLocal() {
   });
 
   const totalOrders = orders.length;
+  const monthly = Object.values(months)
+    .map((bucket) => ({
+      ...bucket,
+      avgOrderValue: bucket.orders ? Math.round(bucket.revenue / bucket.orders) : 0,
+    }))
+    .sort((a, b) => b.month.localeCompare(a.month));
   return {
     totalOrders,
     totalRevenue,
@@ -4162,6 +4211,8 @@ function computeOverallStatsLocal() {
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count),
     sentVia,
+    monthly,
+    currentMonth,
   };
 }
 
@@ -4213,6 +4264,46 @@ function buildOverallCharts(data) {
   return { deliveryChart, revenueChart, itemsChart, methodChart, barChart };
 }
 
+function renderOverallMonthlyTable(data) {
+  const currentMonth = data.currentMonth || currentIstMonthKey();
+  const rows = (data.monthly || []).map((month) => {
+    const current = month.month === currentMonth;
+    return `
+      <tr class="${current ? "is-current" : ""}">
+        <td>${escapeHtml(month.label || formatMonthLabel(month.month))}${current ? '<span class="overall-month-now">This month</span>' : ""}</td>
+        <td>${month.orders || 0}</td>
+        <td>${formatCurrency(month.revenue || 0)}</td>
+        <td>${month.items || 0}</td>
+        <td>${month.pendingOrders || 0}</td>
+        <td>${month.doneOrders || 0}</td>
+        <td>${formatCurrency(month.avgOrderValue || 0)}</td>
+      </tr>
+    `;
+  }).join("");
+  if (!rows) return "";
+  return `
+    <section class="overall-monthly">
+      <h4>Monthly</h4>
+      <div class="overall-month-scroll">
+        <table class="overall-month-table">
+          <thead>
+            <tr>
+              <th>Month</th>
+              <th>Orders</th>
+              <th>Revenue</th>
+              <th>Items</th>
+              <th>Pending</th>
+              <th>Done</th>
+              <th>Avg order</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
 function renderOverallStatsReport(data) {
   const charts = buildOverallCharts(data);
 
@@ -4243,6 +4334,7 @@ function renderOverallStatsReport(data) {
         <strong class="overall-stat-value">${data.doneOrders}</strong>
       </div>
     </div>
+    ${renderOverallMonthlyTable(data)}
     <div class="charts-row overall-charts">
       <div class="chart-panel">
         <div class="chart-panel-title">Orders by Delivery</div>

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, TypeVar
 
 from db import (
@@ -1011,6 +1011,46 @@ def get_profit_loss_summary(
     }
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+_MONTH_NAMES = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def _bill_month_key(created_at: str) -> str:
+    raw = str(created_at or "").strip()
+    try:
+        if raw.endswith("Z"):
+            moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        else:
+            moment = datetime.fromisoformat(raw)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(_IST)
+    except ValueError:
+        moment = datetime.now(_IST)
+    return moment.strftime("%Y-%m")
+
+
+def _month_label(month_key: str) -> str:
+    year, month = month_key.split("-")
+    return f"{_MONTH_NAMES[int(month) - 1]} {year}"
+
+
+def _empty_month(month_key: str) -> dict[str, Any]:
+    return {
+        "month": month_key,
+        "label": _month_label(month_key),
+        "orders": 0,
+        "revenue": 0.0,
+        "discount": 0.0,
+        "items": 0,
+        "pendingOrders": 0,
+        "doneOrders": 0,
+    }
+
+
 def get_overall_stats() -> dict[str, Any]:
     bills = get_all_bills()
 
@@ -1022,12 +1062,16 @@ def get_overall_stats() -> dict[str, Any]:
     service_revenue: dict[str, float] = {}
     service_items: dict[str, int] = {}
     sent_via_map = {"saved": 0, "print": 0, "whatsapp": 0}
+    months: dict[str, dict[str, Any]] = {}
+    current_month = datetime.now(_IST).strftime("%Y-%m")
+    months[current_month] = _empty_month(current_month)
 
     for bill in bills:
         total_revenue += bill["total"]
         total_discount += bill.get("discountAmount") or 0
+        is_done = bill.get("deliveryStatus") == "done"
 
-        if bill.get("deliveryStatus") == "done":
+        if is_done:
             done_orders += 1
         else:
             pending_orders += 1
@@ -1037,9 +1081,23 @@ def get_overall_stats() -> dict[str, Any]:
             via = "print"
         sent_via_map[via] += 1
 
+        month_key = _bill_month_key(bill.get("createdAt") or "")
+        bucket = months.get(month_key)
+        if bucket is None:
+            bucket = _empty_month(month_key)
+            months[month_key] = bucket
+        bucket["orders"] += 1
+        bucket["revenue"] += bill["total"]
+        bucket["discount"] += bill.get("discountAmount") or 0
+        if is_done:
+            bucket["doneOrders"] += 1
+        else:
+            bucket["pendingOrders"] += 1
+
         for item in bill.get("items", []):
             qty = item.get("qty") or 0
             total_items += qty
+            bucket["items"] += qty
             svc = item.get("service") or "Other"
             amount = (item.get("rate") or 0) * qty
             service_revenue[svc] = service_revenue.get(svc, 0) + amount
@@ -1047,6 +1105,11 @@ def get_overall_stats() -> dict[str, Any]:
 
     order_count = len(bills)
     avg_order = round(total_revenue / order_count) if order_count else 0
+    monthly = []
+    for bucket in sorted(months.values(), key=lambda item: item["month"], reverse=True):
+        orders = bucket["orders"]
+        bucket["avgOrderValue"] = round(bucket["revenue"] / orders) if orders else 0
+        monthly.append(bucket)
 
     return {
         "totalOrders": order_count,
@@ -1069,6 +1132,8 @@ def get_overall_stats() -> dict[str, Any]:
             )
         ],
         "sentVia": sent_via_map,
+        "monthly": monthly,
+        "currentMonth": current_month,
     }
 
 
