@@ -1361,6 +1361,10 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           const text = widText(wid);
           if (text && !ids.includes(text)) ids.push(text);
         };
+        push(targetChatId);
+        if (String(targetChatId).endsWith("@c.us")) {
+          push(String(targetChatId).replace("@c.us", "@s.whatsapp.net"));
+        }
         try {
           if (window.WWebJS?.enforceLidAndPnRetrieval) {
             const pair = await window.WWebJS.enforceLidAndPnRetrieval(targetChatId);
@@ -1368,28 +1372,30 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
             push(pair?.phone);
           }
         } catch {
-          /* phone id is still a valid target */
+          /* unsaved numbers can still be messaged by phone id */
         }
         try {
           const phoneWid = window.require("WAWebWidFactory").createWid(targetChatId);
-          const exists = await window.require("WAWebQueryExistsJob").queryWidExists(phoneWid);
-          if (exists?.wid) push(exists.wid);
-          else if (ids.length === 0) return { ids, missing: true };
+          const jobs = window.require("WAWebQueryExistsJob");
+          const method = ["queryWidExists", "queryPhoneExists", "queryExists"].find(
+            (name) => typeof jobs?.[name] === "function"
+          );
+          if (method) {
+            const exists = await jobs[method](phoneWid);
+            push(exists?.wid);
+            push(exists?.lid);
+            push(exists?.phone);
+          }
         } catch {
-          /* lookup crashed; still try the number we were given */
+          /* lookup is optional; the phone number is still the send target */
         }
-        push(targetChatId);
-        return { ids, missing: false };
+        return ids;
       };
 
       try {
-        const lookedUp = await destinationIds();
-        if (lookedUp.missing && lookedUp.ids.length === 0) {
-          return fail("This phone number is not registered on WhatsApp.", "NO_CHAT");
-        }
-
+        const ids = await destinationIds();
         let chat = null;
-        for (const targetId of lookedUp.ids) {
+        for (const targetId of ids) {
           chat = await resolveChat(targetId);
           if (chat?.id) break;
         }
@@ -1471,7 +1477,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   if (result?.code === "NOT_READY") {
     err.code = "COMMS_NOT_READY";
   }
-  if (result?.code === "NO_CHAT" || /not registered|could not open whatsapp chat/i.test(String(result?.error || ""))) {
+  if (result?.code === "NO_CHAT" && /not registered/i.test(String(result?.error || ""))) {
     err.code = "NOT_ON_WHATSAPP";
   }
   if (isContactGetterError(err) || isLidError(err)) {
@@ -1517,20 +1523,6 @@ async function performSend(digits, message, filePath, filename) {
   await applyWhatsAppPagePatches();
   await assertSendReady({ maxCommsWaitMs: 8000 });
 
-  try {
-    const registered = await client.isRegisteredUser(`${digits}@c.us`);
-    if (!registered) {
-      const err = new Error(
-        `Phone number ${digits.slice(-10)} is not registered on WhatsApp.`
-      );
-      err.code = "NOT_ON_WHATSAPP";
-      throw err;
-    }
-  } catch (err) {
-    if (err?.code === "NOT_ON_WHATSAPP") throw err;
-    console.warn("[WhatsApp] Could not verify number on WhatsApp — trying send anyway:", err.message);
-  }
-
   const fullCaption = String(message || "");
   const pdfCaption = captionForPdfSend(fullCaption);
   const media = MessageMedia.fromFilePath(filePath);
@@ -1575,7 +1567,7 @@ async function performSend(digits, message, filePath, filename) {
 
   if (lastErr?.code === "NOT_ON_WHATSAPP") {
     const err = new Error(
-      `Could not open WhatsApp chat for ${digits.slice(-10)}. Check the number is registered on WhatsApp.`
+      `Could not deliver the invoice to ${digits.slice(-10)}. The number must be on WhatsApp, but it does not need to be saved in contacts.`
     );
     err.code = "NOT_ON_WHATSAPP";
     throw err;
