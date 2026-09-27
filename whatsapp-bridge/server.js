@@ -1116,6 +1116,36 @@ async function applyWhatsAppPagePatches() {
       } catch {
         /* optional on this WhatsApp Web build */
       }
+
+      if (window.WWebJS?.getChat && !window.WWebJS.getChat.__rinseUnsaved) {
+        const originalGetChat = window.WWebJS.getChat.bind(window.WWebJS);
+        const wrappedGetChat = async (chatId, opts) => {
+          try {
+            const chat = await originalGetChat(chatId, opts);
+            if (chat?.id) return chat;
+          } catch {
+            /* unsaved numbers need a linked id from WhatsApp first */
+          }
+          try {
+            const raw = String(chatId || "");
+            if (!raw || raw.includes("@lid")) return null;
+            const phoneNumber = raw.split("@")[0];
+            const sync = window.require("WAWebContactSyncUtils");
+            if (typeof sync?.constructUsyncDeltaQuery !== "function") return null;
+            const query = sync.constructUsyncDeltaQuery([{ type: "add", phoneNumber }]);
+            const result = await query.execute();
+            const lid = result?.list?.[0]?.lid?._serialized || result?.list?.[0]?.lid;
+            if (!lid) return null;
+            const lidId = typeof lid === "string" ? lid : lid._serialized;
+            if (!lidId) return null;
+            return await originalGetChat(lidId, opts);
+          } catch {
+            return null;
+          }
+        };
+        wrappedGetChat.__rinseUnsaved = true;
+        window.WWebJS.getChat = wrappedGetChat;
+      }
     });
     pagePatchesApplied = true;
     console.log("[WhatsApp] Applied in-page send patches.");
@@ -1312,7 +1342,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         return null;
       };
 
-      const resolveChat = async (targetId) => {
+      const tryOpenChat = async (targetId) => {
         if (!targetId) return null;
 
         try {
@@ -1332,7 +1362,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
           if (found?.chat?.id) return found.chat;
         } catch {
-          /* try find */
+          /* number has no linked id yet */
         }
 
         try {
@@ -1343,6 +1373,37 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         }
 
         return null;
+      };
+
+      const syncUnsavedNumber = async (targetId) => {
+        try {
+          const raw = String(targetId || "");
+          if (!raw || raw.includes("@lid") || raw.includes("newsletter") || raw.includes("broadcast")) return null;
+          const phoneNumber = raw.split("@")[0];
+          if (!phoneNumber) return null;
+          const sync = window.require("WAWebContactSyncUtils");
+          if (typeof sync?.constructUsyncDeltaQuery !== "function") return null;
+          const query = sync.constructUsyncDeltaQuery([{ type: "add", phoneNumber }]);
+          const result = await query.execute();
+          const entry = result?.list?.[0];
+          const lid = entry?.lid?._serialized || entry?.lid;
+          if (!lid) return null;
+          return typeof lid === "string" ? lid : widText(lid);
+        } catch {
+          return null;
+        }
+      };
+
+      const resolveChat = async (targetId) => {
+        if (!targetId) return null;
+        if (!String(targetId).includes("@lid")) {
+          const lid = await syncUnsavedNumber(targetId);
+          if (lid) {
+            const lidChat = await tryOpenChat(lid);
+            if (lidChat?.id) return lidChat;
+          }
+        }
+        return tryOpenChat(targetId);
       };
 
       const senderForChat = (chat) => {
