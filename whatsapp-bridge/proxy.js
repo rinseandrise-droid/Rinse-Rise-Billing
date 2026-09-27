@@ -9,6 +9,15 @@ const PUBLIC_PORT = Number(process.env.WHATSAPP_BRIDGE_PORT || 3001);
 const INTERNAL_PORT = Number(process.env.WHATSAPP_BRIDGE_INTERNAL_PORT || 3002);
 const INTERNAL_HOST = "127.0.0.1";
 const PROXY_TIMEOUT_MS = Number(process.env.WHATSAPP_PROXY_TIMEOUT_MS || 8000);
+const PROXY_SEND_TIMEOUT_MS = Number(process.env.WHATSAPP_PROXY_SEND_TIMEOUT_MS || 170000);
+
+function timeoutFor(req) {
+  const path = String(req.url || "").split("?")[0];
+  if (req.method === "POST" && (path === "/send" || path === "/send-text" || path === "/send-image")) {
+    return PROXY_SEND_TIMEOUT_MS;
+  }
+  return PROXY_TIMEOUT_MS;
+}
 
 const startedAt = Date.now();
 
@@ -123,7 +132,7 @@ function forward(req, res) {
         path: req.url,
         method: req.method,
         headers,
-        timeout: PROXY_TIMEOUT_MS,
+        timeout: timeoutFor(req),
       },
       (proxyRes) => {
         res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);

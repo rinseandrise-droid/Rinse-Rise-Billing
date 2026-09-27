@@ -84,6 +84,7 @@ let client = null;
 let recovering = false;
 let sendInProgress = false;
 let sendInProgressSince = 0;
+let sendLockToken = 0;
 const SEND_LOCK_MAX_MS = Number(process.env.WHATSAPP_SEND_LOCK_MS || (IS_HOSTED ? 130000 : 90000));
 const SEND_OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || (IS_HOSTED ? 120000 : 90000));
 const SEND_LOCK_FORCE_CLEAR_MS = Number(process.env.WHATSAPP_SEND_FORCE_CLEAR_MS || 25000);
@@ -453,6 +454,7 @@ function clearSendLockIfStale() {
   if (!sendInProgress) return;
   if (Date.now() - sendInProgressSince > SEND_LOCK_MAX_MS) {
     console.warn("[WhatsApp] Cleared stale send lock after timeout.");
+    sendLockToken += 1;
     sendInProgress = false;
     sendInProgressSince = 0;
   }
@@ -460,15 +462,32 @@ function clearSendLockIfStale() {
 
 function acquireSendLock() {
   clearSendLockIfStale();
-  if (sendInProgress) return false;
+  if (sendInProgress) return 0;
   sendInProgress = true;
   sendInProgressSince = Date.now();
-  return true;
+  sendLockToken += 1;
+  return sendLockToken;
 }
 
-function releaseSendLock() {
+function releaseSendLock(token) {
+  if (token && token !== sendLockToken) return;
+  sendLockToken += 1;
   sendInProgress = false;
   sendInProgressSince = 0;
+}
+
+async function waitForSendLock(maxWaitMs = 40000) {
+  const started = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    const token = acquireSendLock();
+    if (token) return token;
+    await sleep(500);
+  }
+  console.warn("[WhatsApp] Previous send still running — taking over the send slot.");
+  sendLockToken += 1;
+  sendInProgress = true;
+  sendInProgressSince = Date.now();
+  return sendLockToken;
 }
 
 function sendBusyResponse(res) {
@@ -507,11 +526,6 @@ async function withSendTimeout(promise, label = "send") {
         }, SEND_OPERATION_TIMEOUT_MS);
       }),
     ]);
-  } catch (err) {
-    if (/timed out/i.test(String(err?.message || err))) {
-      releaseSendLock();
-    }
-    throw err;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -1674,12 +1688,10 @@ app.post("/reset", async (_req, res) => {
 });
 
 app.post("/send-image", async (req, res) => {
-  if (!acquireSendLock()) {
-    return sendBusyResponse(res);
-  }
+  const sendToken = await waitForSendLock();
 
   if (!state.ready || !client) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(503).json({
       error: "WhatsApp not connected. Scan QR code in billing app.",
       needsReconnect: true,
@@ -1689,13 +1701,13 @@ app.post("/send-image", async (req, res) => {
   const { phone, message, imagePath, filename } = req.body || {};
   const digits = normalizePhone(phone);
   if (digits.length < 11) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Invalid phone number." });
   }
 
   const filePath = path.resolve(String(imagePath || ""));
   if (!filePath || !fs.existsSync(filePath)) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Offer image file not found." });
   }
 
@@ -1709,17 +1721,15 @@ app.post("/send-image", async (req, res) => {
       needsReconnect: isSessionError(err),
     });
   } finally {
-    releaseSendLock();
+    releaseSendLock(sendToken);
   }
 });
 
 app.post("/send-text", async (req, res) => {
-  if (!acquireSendLock()) {
-    return sendBusyResponse(res);
-  }
+  let sendToken = await waitForSendLock();
 
   if (!state.ready || !client) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(503).json({
       error: "WhatsApp not connected. Scan QR code in billing app.",
       needsReconnect: true,
@@ -1729,11 +1739,11 @@ app.post("/send-text", async (req, res) => {
   const { phone, message } = req.body || {};
   const digits = normalizePhone(phone);
   if (digits.length < 11) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Invalid phone number." });
   }
   if (!String(message || "").trim()) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Message is required." });
   }
 
@@ -1748,7 +1758,7 @@ app.post("/send-text", async (req, res) => {
 
       if (isSessionError(err)) {
         console.error("[WhatsApp] Send-text session error:", err.message);
-        releaseSendLock();
+        releaseSendLock(sendToken);
         const reconnected = await softRecoverClient(err.message);
         if (!reconnected) {
           return res.status(503).json({
@@ -1756,14 +1766,12 @@ app.post("/send-text", async (req, res) => {
             needsReconnect: true,
           });
         }
-        if (!acquireSendLock()) {
-          return sendBusyResponse(res);
-        }
+        sendToken = await waitForSendLock();
         try {
           await withSendTimeout(performSendText(digits, message), "text send retry");
           return res.json({ ok: true, recovered: true });
         } finally {
-          releaseSendLock();
+          releaseSendLock(sendToken);
         }
       }
 
@@ -1773,17 +1781,15 @@ app.post("/send-text", async (req, res) => {
     console.error("[WhatsApp] Send-text failed:", err);
     return res.status(500).json({ error: err.message || "Send failed." });
   } finally {
-    releaseSendLock();
+    releaseSendLock(sendToken);
   }
 });
 
 app.post("/send", async (req, res) => {
-  if (!acquireSendLock()) {
-    return sendBusyResponse(res);
-  }
+  const sendToken = await waitForSendLock();
 
   if (!state.ready || !client) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(503).json({
       error: "WhatsApp not connected. Scan QR code in billing app.",
       needsReconnect: true,
@@ -1793,13 +1799,13 @@ app.post("/send", async (req, res) => {
   const { phone, message, pdfPath, filename } = req.body || {};
   const digits = normalizePhone(phone);
   if (digits.length < 11) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Invalid phone number." });
   }
 
   const filePath = path.resolve(String(pdfPath || ""));
   if (!filePath || !fs.existsSync(filePath)) {
-    releaseSendLock();
+    releaseSendLock(sendToken);
     return res.status(400).json({ error: "Invoice PDF file not found." });
   }
 
@@ -1869,7 +1875,7 @@ app.post("/send", async (req, res) => {
       needsReconnect: isSessionError(err),
     });
   } finally {
-    releaseSendLock();
+    releaseSendLock(sendToken);
   }
 });
 

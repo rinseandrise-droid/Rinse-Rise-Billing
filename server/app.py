@@ -320,7 +320,7 @@ def api_bill_invoice_pdf(bill_id: int):
     response = send_file(
         pdf_path,
         mimetype="application/pdf",
-        as_attachment=True,
+        as_attachment=False,
         download_name=invoice_filename(bill),
     )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"

@@ -733,7 +733,7 @@ function isWhatsAppReconnectError(message) {
 }
 
 function isWhatsAppSendBusyError(message) {
-  return /another whatsapp send is in progress|send is in progress|still sending the previous|already sending another invoice/i.test(
+  return /another whatsapp send is in progress|send is in progress|still sending the previous|already sending another invoice|finishing the previous send|send slot was busy|previous send took too long/i.test(
     String(message || "")
   );
 }
@@ -5297,11 +5297,6 @@ async function sendHistoryWhatsApp(bill, btn, { skipPaymentValidation = false } 
       message: err.message || "Something went wrong. Please try again.",
       variant: "error",
     });
-    try {
-      await downloadBillInvoicePdf(bill);
-    } catch {
-      /* ignore */
-    }
   }
 }
 
