@@ -4544,7 +4544,6 @@ function renderHistoryList() {
   const range = getHistoryDateRange();
   const periodPending = inPeriod.filter((b) => getDeliveryStatus(b) === "pending").length;
   const periodReady = inPeriod.filter((b) => getDeliveryStatus(b) === "ready").length;
-  const periodRevenue = history.reduce((sum, b) => sum + (b.total || 0), 0);
 
   syncHistoryPeriodUi();
 
@@ -4552,13 +4551,13 @@ function renderHistoryList() {
   if (history.length === 0) {
     countText = `${range.label} · 0 bills`;
   } else if (historyStatusFilter === "ready") {
-    countText = `${history.length} order ready · ${formatCurrency(periodRevenue)}`;
+    countText = `${history.length} order ready`;
   } else if (historyStatusFilter === "pending") {
-    countText = `${history.length} pending · ${formatCurrency(periodRevenue)}`;
+    countText = `${history.length} pending`;
   } else if (historyStatusFilter === "done") {
-    countText = `${history.length} done · ${formatCurrency(periodRevenue)}`;
+    countText = `${history.length} done`;
   } else {
-    countText = `${history.length} bill${history.length === 1 ? "" : "s"} · ${formatCurrency(periodRevenue)} · ${periodPending} pending · ${periodReady} ready`;
+    countText = `${history.length} bill${history.length === 1 ? "" : "s"} · ${periodPending} pending · ${periodReady} ready`;
   }
   els.historyCount.textContent = countText;
 
@@ -4566,7 +4565,6 @@ function renderHistoryList() {
     const parts = [range.label];
     if (history.length > 0) {
       parts.push(`${history.length} order${history.length === 1 ? "" : "s"}`);
-      parts.push(formatCurrency(periodRevenue));
     }
     els.historyPeriodSummary.innerHTML = `<strong>${parts[0]}</strong>${parts.length > 1 ? `<span>${parts.slice(1).join(" · ")}</span>` : ""}`;
   }
