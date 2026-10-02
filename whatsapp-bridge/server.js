@@ -1096,7 +1096,7 @@ function phoneChatTargets(digits) {
 
 let pagePatchesApplied = false;
 async function applyWhatsAppPagePatches() {
-  if (!client?.pupPage || pagePatchesApplied) return;
+  if (!client?.pupPage) return;
   try {
     await client.pupPage.evaluate(() => {
       try {
@@ -1127,9 +1127,29 @@ async function applyWhatsAppPagePatches() {
       } catch {
         /* optional on this WhatsApp Web build */
       }
+
+      if (window.WWebJS?.processMediaData && !window.WWebJS.processMediaData.__rinseNoXid) {
+        const originalProcess = window.WWebJS.processMediaData.bind(window.WWebJS);
+        const wrappedProcess = async (...args) => {
+          const media = await originalProcess(...args);
+          if (!media || typeof media !== "object") return media;
+          const plain = { ...media };
+          delete plain.__x_id;
+          if (typeof media.toJSON === "function") {
+            plain.toJSON = () => {
+              const json = { ...media.toJSON() };
+              delete json.__x_id;
+              return json;
+            };
+          }
+          return plain;
+        };
+        wrappedProcess.__rinseNoXid = true;
+        window.WWebJS.processMediaData = wrappedProcess;
+      }
     });
+    if (!pagePatchesApplied) console.log("[WhatsApp] Applied in-page send patches.");
     pagePatchesApplied = true;
-    console.log("[WhatsApp] Applied in-page send patches.");
   } catch (err) {
     console.warn("[WhatsApp] Page patches failed:", err.message);
   }
@@ -1139,6 +1159,7 @@ function serializeWid(wid) {
   if (!wid) return null;
   if (typeof wid === "string") return wid;
   if (wid._serialized) return wid._serialized;
+  if (wid.$1) return wid.$1;
   if (wid.user && wid.server) return `${wid.user}@${wid.server}`;
   return null;
 }
@@ -1254,7 +1275,7 @@ async function verifyRecentDocumentInChat(chatId, filename, msgId, sentAfterSec,
         const nowSec = Math.floor(Date.now() / 1000);
         for (const msg of recent) {
           if (!msg?.fromMe) continue;
-          if (expectedMsgId && msg.id?._serialized !== expectedMsgId) continue;
+          if (expectedMsgId && (msg.id?._serialized || msg.id?.$1) !== expectedMsgId) continue;
           const type = msg.type || msg.kind;
           if (type !== "document") continue;
           const msgTime = Number(msg.t || 0);
@@ -1319,6 +1340,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         if (!wid) return null;
         if (typeof wid === "string") return wid;
         if (wid._serialized) return wid._serialized;
+        if (wid.$1) return wid.$1;
         if (wid.user && wid.server) return `${wid.user}@${wid.server}`;
         return null;
       };
@@ -1367,7 +1389,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           const query = sync.constructUsyncDeltaQuery([{ type: "add", phoneNumber }]);
           const result = await query.execute();
           const entry = result?.list?.[0];
-          const lid = entry?.lid?._serialized || entry?.lid;
+          const lid = entry?.lid?._serialized || entry?.lid?.$1 || entry?.lid;
           if (!lid) return null;
           return typeof lid === "string" ? lid : widText(lid);
         } catch {
@@ -1471,11 +1493,8 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
         }
 
         const message = {
-          id: newMsgKey,
           ack: 0,
           body: mediaOptions.preview || "",
-          from,
-          to: chat.id,
           local: true,
           self: "out",
           t: parseInt(String(Date.now() / 1000), 10),
@@ -1485,17 +1504,25 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           ...mediaOptions,
           ...(typeof mediaOptions.toJSON === "function" ? mediaOptions.toJSON() : {}),
         };
+        // MediaData's private __x_id collides with Msg's id during Msg init.
+        delete message.__x_id;
+        message.id = newMsgKey;
+        message.from = from;
+        message.to = chat.id;
+        message.type = "document";
 
         const [msgPromise, sendMsgResultPromise] = window
           .require("WAWebSendMsgChatAction")
           .addAndSendMsgToChat(chat, message);
         await msgPromise;
         await sendMsgResultPromise;
-        const msgId = newMsgKey._serialized;
+        const msgId = widText(newMsgKey) || (typeof newMsgKey.toString === "function" ? newMsgKey.toString() : null);
         const ack = window.require("WAWebCollections").Msg.get(msgId)?.ack ?? 0;
         return { ok: true, msgId, ack, chatId: widText(chat.id) };
       } catch (err) {
-        return fail(err?.message || err);
+        const failure = fail(err?.message || err);
+        failure.stack = String(err?.stack || "").split("\n").slice(0, 6).join(" | ");
+        return failure;
       }
     },
     chatId,
@@ -1506,6 +1533,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   if (result?.ok && result.msgId) {
     return true;
   }
+  if (result?.stack) console.warn("[WhatsApp] Direct PDF send stack:", result.stack);
   const err = new Error(result?.error || "Failed to send on WhatsApp.");
   if (result?.code === "NOT_READY") {
     err.code = "COMMS_NOT_READY";
@@ -1537,7 +1565,7 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
     linkPreview: false,
     waitUntilMsgSent: true,
   });
-  const msgId = msg?.id?._serialized || null;
+  const msgId = msg?.id?._serialized || msg?.id?.$1 || null;
   if (!msgId) {
     throw directError || new Error("WhatsApp did not accept the PDF message.");
   }
@@ -1619,6 +1647,7 @@ async function performSend(digits, message, filePath, filename) {
 
 async function performSendText(digits, message) {
   ensureWwebjs();
+  await applyWhatsAppPagePatches();
   await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const targets = await resolveSendTargets(digits);
@@ -1654,6 +1683,7 @@ async function performSendText(digits, message) {
 
 async function performSendImage(digits, message, filePath, filename) {
   ensureWwebjs();
+  await applyWhatsAppPagePatches();
   await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const targets = await resolveSendTargets(digits);
