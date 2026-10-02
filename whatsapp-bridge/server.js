@@ -1095,17 +1095,27 @@ function phoneChatTargets(digits) {
 }
 
 let pagePatchesApplied = false;
+/** "pn" forces phone-number addressing; "native" lets WhatsApp Web use its own LID addressing. */
+let lidAddressingMode = process.env.WA_LID_MODE === "pn" ? "pn" : "native";
+
 async function applyWhatsAppPagePatches() {
   if (!client?.pupPage) return;
   try {
-    await client.pupPage.evaluate(() => {
+    await client.pupPage.evaluate((forcePn) => {
       try {
         const gating = window.require("WAWebLid1X1MigrationGating");
-        if (gating?.Lid1X1MigrationUtils) {
-          gating.Lid1X1MigrationUtils.isLidMigrated = () => false;
+        const utils = gating?.Lid1X1MigrationUtils;
+        if (utils && !utils.__rinseOriginalIsLidMigrated) {
+          utils.__rinseOriginalIsLidMigrated = utils.isLidMigrated;
         }
-        if (typeof gating?.shouldHaveAccountLid === "function") {
-          gating.shouldHaveAccountLid = () => false;
+        if (gating && typeof gating.shouldHaveAccountLid === "function" && !gating.__rinseOriginalShouldHaveAccountLid) {
+          gating.__rinseOriginalShouldHaveAccountLid = gating.shouldHaveAccountLid;
+        }
+        if (utils?.__rinseOriginalIsLidMigrated) {
+          utils.isLidMigrated = forcePn ? () => false : utils.__rinseOriginalIsLidMigrated;
+        }
+        if (gating?.__rinseOriginalShouldHaveAccountLid) {
+          gating.shouldHaveAccountLid = forcePn ? () => false : gating.__rinseOriginalShouldHaveAccountLid;
         }
       } catch {
         /* this WhatsApp Web build uses a different module layout */
@@ -1147,7 +1157,7 @@ async function applyWhatsAppPagePatches() {
         wrappedProcess.__rinseNoXid = true;
         window.WWebJS.processMediaData = wrappedProcess;
       }
-    });
+    }, lidAddressingMode === "pn");
     if (!pagePatchesApplied) console.log("[WhatsApp] Applied in-page send patches.");
     pagePatchesApplied = true;
   } catch (err) {
@@ -1248,15 +1258,31 @@ async function sendMediaToChat(chatId, media, caption) {
 async function waitForMessageAck(msgId, timeoutMs = 25000) {
   if (!client?.pupPage || !msgId) return false;
   const deadline = Date.now() + timeoutMs;
+  let lastAck = null;
+  let missing = 0;
   while (Date.now() < deadline) {
     const ack = await client.pupPage.evaluate((id) => {
-      const msg = window.require("WAWebCollections").Msg.get(id);
-      return typeof msg?.ack === "number" ? msg.ack : -1;
+      const msgs = window.require("WAWebCollections").Msg;
+      let msg = null;
+      try {
+        msg = msgs.get(id);
+      } catch {
+        msg = null;
+      }
+      if (!msg && typeof msgs.getModelsArray === "function") {
+        msg = msgs
+          .getModelsArray()
+          .find((m) => (m?.id?._serialized || m?.id?.$1 || String(m?.id || "")) === id);
+      }
+      return typeof msg?.ack === "number" ? msg.ack : -99;
     }, msgId);
+    lastAck = ack;
     if (ack >= 1) return true;
-    if (ack < 0) break;
+    if (ack === -99) missing += 1;
+    if (missing > 5) break;
     await sleep(750);
   }
+  console.warn(`[WhatsApp] No delivery ack for ${msgId} (last ack ${lastAck}).`);
   return false;
 }
 
@@ -1515,10 +1541,16 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
           .require("WAWebSendMsgChatAction")
           .addAndSendMsgToChat(chat, message);
         await msgPromise;
-        await sendMsgResultPromise;
+        const sendResult = await sendMsgResultPromise;
         const msgId = widText(newMsgKey) || (typeof newMsgKey.toString === "function" ? newMsgKey.toString() : null);
         const ack = window.require("WAWebCollections").Msg.get(msgId)?.ack ?? 0;
-        return { ok: true, msgId, ack, chatId: widText(chat.id) };
+        let sendStatus = "";
+        try {
+          sendStatus = String(sendResult?.messageSendResult ?? JSON.stringify(sendResult) ?? "");
+        } catch {
+          sendStatus = String(sendResult);
+        }
+        return { ok: true, msgId, ack, sendStatus, chatId: widText(chat.id) };
       } catch (err) {
         const failure = fail(err?.message || err);
         failure.stack = String(err?.stack || "").split("\n").slice(0, 6).join(" | ");
@@ -1531,7 +1563,13 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   );
 
   if (result?.ok && result.msgId) {
-    return true;
+    console.log(
+      `[WhatsApp] PDF queued in ${result.chatId} (mode ${lidAddressingMode}, ack ${result.ack}, result ${result.sendStatus || "-"})`
+    );
+    if (await waitForMessageAck(result.msgId, 20000)) return true;
+    const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
+    err.code = "SEND_NOT_CONFIRMED";
+    throw err;
   }
   if (result?.stack) console.warn("[WhatsApp] Direct PDF send stack:", result.stack);
   const err = new Error(result?.error || "Failed to send on WhatsApp.");
@@ -1569,6 +1607,11 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
   if (!msgId) {
     throw directError || new Error("WhatsApp did not accept the PDF message.");
   }
+  if (!(await waitForMessageAck(msgId, 20000))) {
+    const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
+    err.code = "SEND_NOT_CONFIRMED";
+    throw err;
+  }
 }
 
 function captionForPdfSend(message) {
@@ -1602,6 +1645,13 @@ async function performSend(digits, message, filePath, filename) {
       lastErr = err;
       console.warn(`[WhatsApp] Bill send attempt ${attempt}/2 (${chatId}):`, err.message);
       if (err?.code === "NOT_ON_WHATSAPP") break;
+      if (err?.code === "SEND_NOT_CONFIRMED") {
+        if (attempt >= 2) break;
+        lidAddressingMode = lidAddressingMode === "pn" ? "native" : "pn";
+        console.warn(`[WhatsApp] Switching addressing mode to ${lidAddressingMode} and retrying.`);
+        await applyWhatsAppPagePatches();
+        continue;
+      }
       if (isCommsError(err) && attempt < 2) {
         await sleep(2500);
         continue;
@@ -1614,7 +1664,7 @@ async function performSend(digits, message, filePath, filename) {
   }
 
   const fallbackChatId = `${digits}@s.whatsapp.net`;
-  if (lastErr?.code !== "NOT_ON_WHATSAPP") {
+  if (lastErr?.code !== "NOT_ON_WHATSAPP" && lastErr?.code !== "SEND_NOT_CONFIRMED") {
     try {
       await ensureChatRegistered(fallbackChatId);
       await sendBillPdfMessage(fallbackChatId, media, pdfCaption, filePath, filename);
