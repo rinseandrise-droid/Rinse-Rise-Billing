@@ -1615,10 +1615,7 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
 }
 
 function captionForPdfSend(message) {
-  const lines = String(message || "")
-    .split("\n")
-    .filter((line) => !/https?:\/\//i.test(line));
-  const text = lines.join("\n").trim();
+  const text = String(message || "").trim();
   return text || "Your invoice from Rinse & Rise Laundryrite is attached.";
 }
 
