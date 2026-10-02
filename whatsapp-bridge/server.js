@@ -1566,7 +1566,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
     console.log(
       `[WhatsApp] PDF queued in ${result.chatId} (mode ${lidAddressingMode}, ack ${result.ack}, result ${result.sendStatus || "-"})`
     );
-    if (await waitForMessageAck(result.msgId, 20000)) return true;
+    if (await waitForMessageAck(result.msgId, 20000)) return result.chatId || chatId;
     const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
     err.code = "SEND_NOT_CONFIRMED";
     throw err;
@@ -1585,11 +1585,67 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
   throw err;
 }
 
+/** Plain text via addAndSendMsgToChat into an already-open chat (no link-preview/contact getters). */
+async function sendTextToOpenChat(chatId, text) {
+  if (!client?.pupPage || !chatId || !text) return false;
+  const result = await client.pupPage.evaluate(
+    async (targetChatId, body) => {
+      try {
+        const wid = window.require("WAWebWidFactory").createWid(targetChatId);
+        const chat = window.require("WAWebCollections").Chat.get(wid);
+        if (!chat?.id) return { ok: false, error: "chat not open" };
+        const prefs = window.require("WAWebUserPrefsMeUser");
+        const isLid = String(targetChatId).includes("@lid");
+        const lidUser = typeof prefs.getMaybeMeLidUser === "function" ? prefs.getMaybeMeLidUser() : null;
+        const pnUser = typeof prefs.getMaybeMePnUser === "function" ? prefs.getMaybeMePnUser() : null;
+        const from = isLid ? lidUser || pnUser : pnUser || lidUser;
+        const MsgKey = window.require("WAWebMsgKey");
+        const newMsgKey = new MsgKey({ from, to: chat.id, id: await MsgKey.newId(), selfDir: "out" });
+        let ephemeralFields = {};
+        try {
+          ephemeralFields =
+            window.require("WAWebGetEphemeralFieldsMsgActionsUtils").getEphemeralFields(chat) || {};
+        } catch {
+          ephemeralFields = {};
+        }
+        const message = {
+          ...ephemeralFields,
+          id: newMsgKey,
+          ack: 0,
+          body,
+          from,
+          to: chat.id,
+          local: true,
+          self: "out",
+          t: parseInt(String(Date.now() / 1000), 10),
+          isNewMsg: true,
+          type: "chat",
+        };
+        const [msgPromise, sendResultPromise] = window
+          .require("WAWebSendMsgChatAction")
+          .addAndSendMsgToChat(chat, message);
+        await msgPromise;
+        await sendResultPromise;
+        const msgId = newMsgKey._serialized || newMsgKey.$1 || newMsgKey.toString();
+        return { ok: true, msgId };
+      } catch (err) {
+        return { ok: false, error: String(err?.message || err) };
+      }
+    },
+    chatId,
+    text
+  );
+  if (!result?.ok) {
+    console.warn("[WhatsApp] Bill text send failed:", result?.error);
+    return false;
+  }
+  return waitForMessageAck(result.msgId, 15000);
+}
+
 async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
   let directError = null;
   try {
-    await sendDocumentRobust(chatId, filePath, filename, caption || "");
-    return;
+    return await sendDocumentRobust(chatId, filePath, filename, caption || "");
   } catch (err) {
     directError = err;
     console.warn("[WhatsApp] Direct PDF send failed, trying library send:", err.message);
@@ -1611,6 +1667,21 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
     const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
     err.code = "SEND_NOT_CONFIRMED";
     throw err;
+  }
+  return serializeWid(msg?.id?.remote) || chatId;
+}
+
+async function sendBillText(resolvedChatId, fallbackChatId, text) {
+  if (!text) return;
+  if (await sendTextToOpenChat(resolvedChatId, text)) {
+    console.log(`[WhatsApp] Bill message sent to ${resolvedChatId}`);
+    return;
+  }
+  try {
+    await client.sendMessage(fallbackChatId, text, { linkPreview: false, sendSeen: false });
+    console.log(`[WhatsApp] Bill message sent via library to ${fallbackChatId}`);
+  } catch (err) {
+    console.warn("[WhatsApp] Bill message (text) could not be sent:", err.message);
   }
 }
 
@@ -1635,8 +1706,9 @@ async function performSend(digits, message, filePath, filename) {
     try {
       if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
       await ensureChatRegistered(chatId);
-      await sendBillPdfMessage(chatId, media, pdfCaption, filePath, filename);
+      const sentChatId = await sendBillPdfMessage(chatId, media, "", filePath, filename);
       console.log(`[WhatsApp] Bill PDF sent to ${chatId}`);
+      await sendBillText(sentChatId || chatId, chatId, pdfCaption);
       return;
     } catch (err) {
       lastErr = err;
@@ -1664,8 +1736,9 @@ async function performSend(digits, message, filePath, filename) {
   if (lastErr?.code !== "NOT_ON_WHATSAPP" && lastErr?.code !== "SEND_NOT_CONFIRMED") {
     try {
       await ensureChatRegistered(fallbackChatId);
-      await sendBillPdfMessage(fallbackChatId, media, pdfCaption, filePath, filename);
+      const sentChatId = await sendBillPdfMessage(fallbackChatId, media, "", filePath, filename);
       console.log(`[WhatsApp] Bill PDF sent to ${fallbackChatId}`);
+      await sendBillText(sentChatId || fallbackChatId, fallbackChatId, pdfCaption);
       return;
     } catch (err) {
       lastErr = err;
