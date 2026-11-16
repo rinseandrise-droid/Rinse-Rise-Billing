@@ -89,6 +89,24 @@ Look for:
 - Session files live in `/app/data/whatsapp-auth`
 - Service RAM: **at least 1 GB** (512 MB causes Chromium crashes → reconnect loops)
 
+## Lower cost on Railway (same features)
+
+Usage billing is driven mostly by **memory GB×minutes**. WhatsApp + Chromium needs the stack to stay up; these tweaks **do not change app logic** — only idle RAM:
+
+| Action | Effect |
+|--------|--------|
+| Service RAM **1 GB** (not 2 GB) | Enough for WhatsApp; don’t over-provision |
+| Remove unused services / environments | Stops extra Postgres or trial deploys (e.g. duplicate env names in billing) |
+| After deploy, defaults apply automatically | **2 Gunicorn threads** (was 8), Node heap **768 MB** on Railway — see `docker-entrypoint.sh` |
+| Optional variable `GUNICORN_THREADS=8` | Restore old concurrency if a busy shop needs it |
+| Optional `NODE_OPTIONS=--max-old-space-size=1024` | If bridge restarts often, bump heap back |
+
+For **much lower monthly cost** with the **same Docker behavior**, use a fixed-price VPS — see **[VPS_HOSTING.md](./VPS_HOSTING.md)** (`docker compose up`).
+
+### SQLite-only on Railway (optional cost cut)
+
+If a **Volume** is mounted at `/app/data` and Postgres is only for cloud backup you don’t need, you can remove the **PostgreSQL** service and unset `DATABASE_URL`. The app uses **SQLite** on the volume — same billing/history logic as local. Keep Postgres if you rely on managed DB backups.
+
 ## Local development
 
 Run **Start Billing.bat** — data stays in `data/rinse_rise.db` on your PC (not affected by Railway deploys).

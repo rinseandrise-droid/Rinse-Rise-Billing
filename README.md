@@ -84,6 +84,8 @@ docker compose up --build
 
 Open [http://localhost:8080](http://localhost:8080)
 
+Bills, Postgres, WhatsApp, and `/app/data` persist via Docker volumes. For **lower hosting cost** (same stack), see **[VPS_HOSTING.md](./VPS_HOSTING.md)**.
+
 ### Docker build only
 
 ```bash
@@ -91,7 +93,7 @@ docker build -t rinse-rise-billing .
 docker run -p 8080:8080 -e DATABASE_URL="your-postgres-url" rinse-rise-billing
 ```
 
-**Note:** WhatsApp PDF send is for local Windows use (`Start Billing.bat` + Node bridge). Docker/Railway deployment covers billing, history, PDF download, and PostgreSQL storage.
+**Note:** Docker and Railway run the full stack (billing, PostgreSQL, WhatsApp bridge). Windows shop PCs can still use `Start Billing.bat` — don’t run local WhatsApp and Railway/VPS WhatsApp on the same account at once.
 
 ## Notes
 

@@ -21,8 +21,25 @@ fi
 # Stale lock from a previous container must not block startup
 rm -f "$WA_AUTH/.bridge.lock" 2>/dev/null || true
 
-export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=1024}"
 export RAILWAY_ENVIRONMENT="${RAILWAY_ENVIRONMENT:-1}"
+
+if [ -z "${NODE_OPTIONS:-}" ]; then
+  if [ -n "${RAILWAY_ENVIRONMENT:-}" ]; then
+    export NODE_OPTIONS="--max-old-space-size=768"
+  else
+    export NODE_OPTIONS="--max-old-space-size=1024"
+  fi
+else
+  export NODE_OPTIONS
+fi
+
+if [ -z "${GUNICORN_THREADS:-}" ]; then
+  if [ -n "${RAILWAY_ENVIRONMENT:-}" ]; then
+    GUNICORN_THREADS=2
+  else
+    GUNICORN_THREADS=8
+  fi
+fi
 export WHATSAPP_CLIENT_ID="${WHATSAPP_CLIENT_ID:-rinse-rise}"
 export WHATSAPP_AUTH_DIR="$WA_AUTH"
 export WHATSAPP_CACHE_DIR="$WA_CACHE"
@@ -115,12 +132,12 @@ if [ ! -f "$DATA/.persistent_volume" ]; then
   echo "WARNING: Railway Volume may not be mounted at /app/data — WhatsApp will need QR scan after every deploy."
 fi
 
-echo "Starting Gunicorn on port ${PORT}..."
+echo "Starting Gunicorn on port ${PORT} (workers ${WEB_CONCURRENCY:-1}, threads ${GUNICORN_THREADS})..."
 echo "Persistent data directory: $DATA (mount a Railway Volume here)"
 exec gunicorn \
   --bind "0.0.0.0:${PORT}" \
   --workers "${WEB_CONCURRENCY:-1}" \
-  --threads 8 \
+  --threads "${GUNICORN_THREADS}" \
   --timeout 120 \
   --access-logfile - \
   --error-logfile - \

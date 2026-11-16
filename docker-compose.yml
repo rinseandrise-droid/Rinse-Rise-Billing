@@ -1,3 +1,5 @@
+# Same stack as Railway: billing + Postgres + WhatsApp (fixed monthly cost on a VPS).
+# Usage: docker compose up --build -d
 services:
   web:
     build: .
@@ -6,6 +8,12 @@ services:
     environment:
       PORT: "8080"
       DATABASE_URL: postgresql://postgres:postgres@db:5432/rinse_rise
+      DATA_DIR: /app/data
+      WHATSAPP_ENABLED: "1"
+      # Override in .env if needed; local default stays 8 threads via entrypoint when RAILWAY_ENVIRONMENT is unset
+      GUNICORN_THREADS: "2"
+    volumes:
+      - appdata:/app/data
     depends_on:
       db:
         condition: service_healthy
@@ -28,3 +36,4 @@ services:
 
 volumes:
   pgdata:
+  appdata:
