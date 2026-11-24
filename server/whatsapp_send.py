@@ -510,25 +510,6 @@ def send_bill_via_whatsapp(bill: dict[str, Any]) -> dict[str, Any]:
     pdf_path = generate_invoice_pdf(bill)
     filename = invoice_filename(bill)
 
-    status = get_bridge_status()
-    if not status.get("ready") and status.get("sessionRestoring"):
-        deadline = time.monotonic() + (120 if is_cloud_deployment() else 60)
-        while time.monotonic() < deadline:
-            time.sleep(2)
-            status = get_bridge_status(auto_start=True)
-            if status.get("ready"):
-                break
-
-    if not status.get("ready"):
-        return {
-            "sent": False,
-            "reason": "not_connected",
-            "bridgeAvailable": status.get("available", False),
-            "pdfPath": str(pdf_path),
-            "filename": filename,
-            "message": message,
-        }
-
     last_error = "Failed to send on WhatsApp."
     needs_reconnect = False
     for attempt in range(4):
@@ -561,8 +542,26 @@ def send_bill_via_whatsapp(bill: dict[str, Any]) -> dict[str, Any]:
             except json.JSONDecodeError:
                 last_error = body or str(exc)
                 needs_reconnect = "detached frame" in last_error.lower()
+            if exc.code == 503 and needs_reconnect:
+                status = get_bridge_status()
+                if not status.get("ready") and status.get("sessionRestoring"):
+                    deadline = time.monotonic() + (120 if is_cloud_deployment() else 60)
+                    while time.monotonic() < deadline:
+                        time.sleep(2)
+                        status = get_bridge_status(auto_start=True)
+                        if status.get("ready"):
+                            break
+                if not status.get("ready"):
+                    return {
+                        "sent": False,
+                        "reason": "not_connected",
+                        "bridgeAvailable": status.get("available", False),
+                        "pdfPath": str(pdf_path),
+                        "filename": filename,
+                        "message": message,
+                    }
             if exc.code in (429, 503) and attempt < 3:
-                time.sleep(max(5, min(retry_after, 15)))
+                time.sleep(max(2, min(retry_after, 15)))
                 continue
             break
         except (urllib.error.URLError, TimeoutError) as exc:

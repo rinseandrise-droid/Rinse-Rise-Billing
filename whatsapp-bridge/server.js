@@ -1098,8 +1098,9 @@ let pagePatchesApplied = false;
 /** "pn" forces phone-number addressing; "native" lets WhatsApp Web use its own LID addressing. */
 let lidAddressingMode = process.env.WA_LID_MODE === "pn" ? "pn" : "native";
 
-async function applyWhatsAppPagePatches() {
+async function applyWhatsAppPagePatches(force = false) {
   if (!client?.pupPage) return;
+  if (pagePatchesApplied && !force) return;
   try {
     await client.pupPage.evaluate((forcePn) => {
       try {
@@ -1280,7 +1281,7 @@ async function waitForMessageAck(msgId, timeoutMs = 25000) {
     if (ack >= 1) return true;
     if (ack === -99) missing += 1;
     if (missing > 5) break;
-    await sleep(750);
+    await sleep(200);
   }
   console.warn(`[WhatsApp] No delivery ack for ${msgId} (last ack ${lastAck}).`);
   return false;
@@ -1586,7 +1587,7 @@ async function sendDocumentRobust(chatId, filePath, filename, caption) {
 }
 
 /** Plain text via addAndSendMsgToChat into an already-open chat (no link-preview/contact getters). */
-async function sendTextToOpenChat(chatId, text) {
+async function sendTextToOpenChat(chatId, text, { waitForAck = true } = {}) {
   if (!client?.pupPage || !chatId || !text) return false;
   const result = await client.pupPage.evaluate(
     async (targetChatId, body) => {
@@ -1639,7 +1640,7 @@ async function sendTextToOpenChat(chatId, text) {
     console.warn("[WhatsApp] Bill text send failed:", result?.error);
     return false;
   }
-  return waitForMessageAck(result.msgId, 15000);
+  return waitForAck ? waitForMessageAck(result.msgId, 15000) : true;
 }
 
 async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
@@ -1671,9 +1672,9 @@ async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
   return serializeWid(msg?.id?.remote) || chatId;
 }
 
-async function sendBillText(resolvedChatId, fallbackChatId, text) {
+async function sendBillText(resolvedChatId, fallbackChatId, text, { waitForAck = true } = {}) {
   if (!text) return;
-  if (await sendTextToOpenChat(resolvedChatId, text)) {
+  if (await sendTextToOpenChat(resolvedChatId, text, { waitForAck })) {
     console.log(`[WhatsApp] Bill message sent to ${resolvedChatId}`);
     return;
   }
@@ -1693,7 +1694,6 @@ function captionForPdfSend(message) {
 async function performSend(digits, message, filePath, filename) {
   ensureWwebjs();
   await applyWhatsAppPagePatches();
-  await assertSendReady({ maxCommsWaitMs: 8000 });
 
   const fullCaption = String(message || "");
   const pdfCaption = captionForPdfSend(fullCaption);
@@ -1708,7 +1708,7 @@ async function performSend(digits, message, filePath, filename) {
       await ensureChatRegistered(chatId);
       const sentChatId = await sendBillPdfMessage(chatId, media, "", filePath, filename);
       console.log(`[WhatsApp] Bill PDF sent to ${chatId}`);
-      await sendBillText(sentChatId || chatId, chatId, pdfCaption);
+      await sendBillText(sentChatId || chatId, chatId, pdfCaption, { waitForAck: false });
       return;
     } catch (err) {
       lastErr = err;
@@ -1718,7 +1718,7 @@ async function performSend(digits, message, filePath, filename) {
         if (attempt >= 2) break;
         lidAddressingMode = lidAddressingMode === "pn" ? "native" : "pn";
         console.warn(`[WhatsApp] Switching addressing mode to ${lidAddressingMode} and retrying.`);
-        await applyWhatsAppPagePatches();
+        await applyWhatsAppPagePatches(true);
         continue;
       }
       if (isCommsError(err) && attempt < 2) {

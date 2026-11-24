@@ -48,6 +48,8 @@ from invoice_pdf import build_whatsapp_message, generate_invoice_pdf, invoice_fi
 from offer_broadcast import get_broadcast_job, save_offer_image, start_offer_broadcast
 from offers import get_offers, save_offers
 from rates import get_rates, save_rates
+from catalogue_search import record_search_event, search_catalogue, seed_catalogue_from_rate_card, ensure_catalogue_search_schema
+from website_schema import ensure_website_schema
 from whatsapp_send import (
     bridge_health_snapshot,
     bridge_is_running,
@@ -334,15 +336,6 @@ def api_send_bill_whatsapp(bill_id: int):
         return jsonify({"error": "Bill not found"}), 404
     if not bill.get("customerPhone"):
         return jsonify({"error": "Customer phone number is required."}), 400
-    payload = request.get_json(silent=True) or {}
-    skip_payment = bool(payload.get("skipPaymentValidation"))
-    if not skip_payment:
-        if not (bill.get("paymentType") or "").strip():
-            return jsonify({"error": "Payment Type is required before sending on WhatsApp."}), 400
-        if not (bill.get("paymentInfo") or "").strip():
-            return jsonify({"error": "Payment Info is required before sending on WhatsApp."}), 400
-    if (bill.get("deliveryStatus") or "").strip() != "done" and (bill.get("sentVia") or "").strip() != "whatsapp":
-        return jsonify({"error": "Order must be marked Delivery Done before sending on WhatsApp."}), 400
     try:
         result = send_bill_via_whatsapp(bill)
         if result.get("sent"):
@@ -395,6 +388,63 @@ def api_get_rates():
         return jsonify(get_rates())
     except (ValueError, FileNotFoundError) as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/catalogue/seed", methods=["POST"])
+def api_catalogue_seed():
+    """Load rate-card items + search keywords into website schema (Postgres only)."""
+    if not is_postgres():
+        return jsonify({"error": "Catalogue search seeding requires PostgreSQL"}), 503
+    try:
+        with get_connection() as conn:
+            ensure_website_schema(conn)
+            ensure_catalogue_search_schema(conn)
+            counts = seed_catalogue_from_rate_card(conn)
+        return jsonify({"ok": True, **counts})
+    except Exception as exc:
+        return jsonify({"error": _friendly_db_error(exc)}), 503
+
+
+@app.route("/api/catalogue/search")
+def api_catalogue_search():
+    """Semantic catalogue search for the customer app."""
+    query = (request.args.get("q") or request.args.get("query") or "").strip()
+    service_id = (request.args.get("serviceId") or request.args.get("service_id") or "").strip() or None
+    group_id = (request.args.get("groupId") or request.args.get("group_id") or "").strip() or None
+    try:
+        limit = min(200, max(1, int(request.args.get("limit") or 80)))
+    except ValueError:
+        limit = 80
+    if not is_postgres():
+        return jsonify({"error": "Catalogue search requires PostgreSQL", "hits": []}), 503
+    try:
+        with get_connection() as conn:
+            hits = search_catalogue(conn, query=query, service_id=service_id, group_id=group_id, limit=limit)
+            if query:
+                record_search_event(conn, query=query, service_id=service_id or "", result_count=len(hits))
+        return jsonify({"query": query, "count": len(hits), "hits": hits})
+    except Exception as exc:
+        return jsonify({"error": _friendly_db_error(exc), "hits": []}), 503
+
+
+@app.route("/api/catalogue/search-events", methods=["POST"])
+def api_catalogue_search_event():
+    data = request.get_json(force=True, silent=True) or {}
+    if not is_postgres():
+        return jsonify({"ok": False, "error": "PostgreSQL required"}), 503
+    try:
+        with get_connection() as conn:
+            record_search_event(
+                conn,
+                query=str(data.get("query") or ""),
+                service_id=str(data.get("serviceId") or data.get("service_id") or ""),
+                result_count=int(data.get("resultCount") or data.get("result_count") or 0),
+                selected_item_id=str(data.get("selectedItemId") or data.get("selected_item_id") or ""),
+                match_kind=str(data.get("matchKind") or data.get("match_kind") or ""),
+            )
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": _friendly_db_error(exc)}), 503
 
 
 @app.route("/api/rates", methods=["PUT"])

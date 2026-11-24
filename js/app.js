@@ -667,9 +667,7 @@ function billWasSentOnWhatsApp(bill) {
 }
 
 function canSendBillOnWhatsApp(bill) {
-  if (normalizePhoneKey(bill?.customerPhone || "").length < 10) return false;
-  if (billWasSentOnWhatsApp(bill)) return true;
-  return getDeliveryStatus(bill) === "done";
+  return normalizePhoneKey(bill?.customerPhone || "").length >= 10;
 }
 
 function getWhatsAppSendButtonLabel(bill) {
@@ -3464,13 +3462,13 @@ async function saveBillToDatabase(
   if (refreshHistory) {
     void refreshBillHistory({ silent: true }).catch(() => {});
   }
-  try {
-    const counterData = await API.getBillCounter();
-    billCounter = counterData.billCounter;
-    updateBillMeta();
-  } catch {
-    updateBillMeta();
-  }
+  updateBillMeta();
+  void API.getBillCounter()
+    .then((counterData) => {
+      billCounter = counterData.billCounter;
+      updateBillMeta();
+    })
+    .catch(() => {});
   return saved;
 }
 
@@ -5327,19 +5325,11 @@ async function sendHistoryWhatsApp(bill, btn, { skipPaymentValidation = false } 
     });
     return;
   }
-  if (!skipPaymentValidation) {
-    const paymentOk = await confirmPaymentForWhatsApp(bill);
-    if (!paymentOk) return;
-    skipPaymentValidation = getWhatsAppPaymentMissing(bill.paymentType, bill.paymentInfo).length > 0;
-  }
-  if (!validateOrderDoneForWhatsApp(bill.deliveryStatus, { resend: billWasSentOnWhatsApp(bill) })) {
-    return;
-  }
   try {
     await withButtonLoading(btn, async () => {
       setSectionLoading(els.historyView, true, "Sending on WhatsApp…");
       try {
-        await shareBillOnWhatsApp(phone, bill, { skipPaymentValidation });
+        await shareBillOnWhatsApp(phone, bill, { skipPaymentValidation: true });
         const updated = { ...bill, sentVia: "whatsapp" };
         upsertBillInCache(updated);
         selectedHistoryId = updated.id;
@@ -5568,12 +5558,6 @@ async function sendWhatsApp() {
       message: "Enter a valid 10-digit customer phone number before sending on WhatsApp.",
       variant: "warning",
     });
-    return;
-  }
-
-  const missing = getWhatsAppPaymentMissing(getPaymentType(), getPaymentInfo());
-  if (missing.length) {
-    showWhatsAppValidationAlert(getWhatsAppPaymentBlockMessage(missing));
     return;
   }
 
