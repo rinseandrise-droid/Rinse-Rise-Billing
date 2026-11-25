@@ -998,9 +998,9 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
     const timedOut = errText === "INIT_TIMEOUT" || /timeout/i.test(errText);
     const injectFailed = /inject|ExecutionContext|evaluate|Socket/i.test(`${errText}${err?.stack || ""}`);
     if (IS_HOSTED && !_retried && (timedOut || injectFailed || errText)) {
-      if (/Socket/i.test(errText)) {
+      if (/Socket/i.test(errText) || timedOut) {
         skipVersionCache = true;
-        console.warn("[WhatsApp] Socket init failed — retrying with live WA Web (no version cache)…");
+        console.warn("[WhatsApp] Init failed — retrying with live WA Web (no version cache)…", errText);
       } else {
         console.warn("[WhatsApp] Scanner init failed — retrying with remote WA Web cache (session kept)…", errText);
         process.env.WHATSAPP_REMOTE_CACHE = "1";
@@ -1085,6 +1085,8 @@ async function resetSession() {
   releaseSendLock();
   recovering = false;
   qrDuringRestoreCount = 0;
+  skipVersionCache = false;
+  if (IS_HOSTED) process.env.WHATSAPP_REMOTE_CACHE = "0";
   state.ready = false;
   state.qr = null;
   state.qrGeneration = 0;
