@@ -60,7 +60,7 @@ const AUTH_READY_TIMEOUT_MS = Number(
 const RESTORE_QR_GRACE_MS = Number(process.env.WHATSAPP_RESTORE_GRACE_MS || 15000);
 const RESTORE_FAIL_MS = Number(process.env.WHATSAPP_RESTORE_FAIL_MS || (IS_HOSTED ? 300000 : 150000));
 const QR_STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS || (IS_HOSTED ? 180000 : 120000));
-const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 120000 : 90000));
+const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 60000 : 90000));
 const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "rinse-rise";
 
 const state = {
@@ -893,10 +893,18 @@ async function destroyClient() {
   clearRestoreWatchdog();
   clearQrStartupWatchdog();
   if (client) {
+    const browserProc = client.pupBrowser?.process?.();
     try {
-      await Promise.race([client.destroy(), sleep(5000)]);
+      await Promise.race([client.destroy(), sleep(4000)]);
     } catch (err) {
       console.warn("[WhatsApp] Destroy:", err.message);
+    }
+    try {
+      if (browserProc && !browserProc.killed) {
+        browserProc.kill("SIGKILL");
+      }
+    } catch {
+      /* ignore */
     }
     client = null;
   }
@@ -911,7 +919,19 @@ async function destroyClient() {
 }
 
 function wipeAuthDir() {
-  fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+  try {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+  } catch (err) {
+    console.warn("[WhatsApp] wipeAuthDir rmSync failed:", err.message);
+    try {
+      const sDir = sessionDirPath();
+      if (fs.existsSync(sDir)) {
+        fs.renameSync(sDir, `${sDir}-stale-${Date.now()}`);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   clearSessionLinked();
 }
