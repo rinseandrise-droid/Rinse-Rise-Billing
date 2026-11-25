@@ -700,9 +700,11 @@ function createClient() {
   const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE !== "0");
   const puppeteerConfig = {
     headless: true,
+    protocolTimeout: 120000,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
+      ...(IS_HOSTED ? ["--no-zygote"] : []),
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
@@ -1006,10 +1008,11 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
     scheduleRestoreWatchdog();
   }
   scheduleQrStartupWatchdog();
+  const initTimeoutMs = skipVersionCache ? Math.max(INIT_TIMEOUT_MS, 120000) : INIT_TIMEOUT_MS;
   try {
     await Promise.race([
       client.initialize(),
-      sleep(INIT_TIMEOUT_MS).then(() => {
+      sleep(initTimeoutMs).then(() => {
         throw new Error("INIT_TIMEOUT");
       }),
     ]);
