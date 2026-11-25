@@ -57,10 +57,10 @@ const BUNDLED_CACHE_DIR = path.join(__dirname, "wa-cache");
 const AUTH_READY_TIMEOUT_MS = Number(
   process.env.WHATSAPP_AUTH_TIMEOUT_MS || (IS_HOSTED ? 420000 : 180000)
 );
-const RESTORE_QR_GRACE_MS = Number(process.env.WHATSAPP_RESTORE_GRACE_MS || (IS_HOSTED ? 180000 : 60000));
+const RESTORE_QR_GRACE_MS = Number(process.env.WHATSAPP_RESTORE_GRACE_MS || 15000);
 const RESTORE_FAIL_MS = Number(process.env.WHATSAPP_RESTORE_FAIL_MS || (IS_HOSTED ? 300000 : 150000));
 const QR_STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS || (IS_HOSTED ? 180000 : 120000));
-const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 90000 : 90000));
+const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 120000 : 90000));
 const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "rinse-rise";
 
 const state = {
@@ -760,7 +760,7 @@ function bindClientEvents(waClient) {
       restoreGraceExpired = Date.now() - bridgeStartedAt >= RESTORE_QR_GRACE_MS;
       if (!restoreGraceExpired) {
         qrDuringRestoreCount += 1;
-        if (qrDuringRestoreCount <= 3) {
+        if (qrDuringRestoreCount <= 1) {
           state.phase = "restoring";
           state.qr = null;
           state.lastError = "Restoring saved WhatsApp session — no scan needed if already linked.";
@@ -987,7 +987,7 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
       process.env.WHATSAPP_REMOTE_CACHE = "1";
       await destroyClient();
       initInProgress = false;
-      return initializeClient({ fresh: false, _retried: true });
+      return initializeClient({ fresh, _retried: true });
     }
     state.phase = "error";
     state.lastError = `Scanner failed to start: ${errText}. Click Reset Connection and wait for a fresh QR.`;

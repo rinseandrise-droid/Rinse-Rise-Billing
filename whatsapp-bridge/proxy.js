@@ -142,6 +142,7 @@ function forward(req, res) {
 
     proxyReq.on("timeout", () => {
       proxyReq.destroy();
+      if (res.headersSent || res.writableEnded) return;
       if (req.method === "GET" && (req.url.startsWith("/health") || req.url.startsWith("/status"))) {
         sendBooting(req, res);
         return;
@@ -151,6 +152,7 @@ function forward(req, res) {
     });
 
     proxyReq.on("error", () => {
+      if (res.headersSent || res.writableEnded) return;
       if (req.method === "GET" && (req.url.startsWith("/health") || req.url.startsWith("/status"))) {
         sendBooting(req, res);
         return;
