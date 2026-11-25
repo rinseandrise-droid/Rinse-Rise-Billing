@@ -2935,11 +2935,27 @@ async function shareBillOnWhatsApp(phone, bill, { targetWindow = null } = {}) {
   const message = buildWhatsAppBillMessage(bill);
   const url = buildWhatsAppWebUrl(phone, message);
 
-  if (targetWindow && !targetWindow.closed) {
-    targetWindow.location.href = url;
-  } else {
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
+  let navigated = false;
+  if (targetWindow) {
+    try {
+      if (!targetWindow.closed) {
+        targetWindow.location.href = url;
+        targetWindow.focus();
+        navigated = true;
+      }
+    } catch {
+      navigated = false;
+    }
+  }
+  if (!navigated) {
+    const opened = window.open(url, "rinse_whatsapp_web");
+    if (opened) {
+      try {
+        opened.focus();
+      } catch {
+        /* ignore */
+      }
+    } else {
       window.location.href = url;
     }
   }
@@ -5522,7 +5538,7 @@ async function sendWhatsApp() {
     return;
   }
 
-  const waWin = window.open("", "_blank");
+  const waWin = window.open("", "rinse_whatsapp_web");
   try {
     await withButtonLoading(els.whatsappBtn, async () => {
       buildReceipt();
@@ -5532,7 +5548,11 @@ async function sendWhatsApp() {
         completedAt: new Date().toISOString(),
       });
       if (!saved?.id) {
-        if (waWin && !waWin.closed) waWin.close();
+        try {
+          if (waWin && !waWin.closed) waWin.close();
+        } catch {
+          /* ignore */
+        }
         return;
       }
 
@@ -5542,7 +5562,11 @@ async function sendWhatsApp() {
       }
     }, "Opening…");
   } catch (err) {
-    if (waWin && !waWin.closed) waWin.close();
+    try {
+      if (waWin && !waWin.closed) waWin.close();
+    } catch {
+      /* ignore */
+    }
     const block = parseWhatsAppSendError(err.message);
     if (block) {
       showWhatsAppValidationAlert(block);
