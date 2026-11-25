@@ -693,6 +693,8 @@ function validateHostedChrome() {
   return false;
 }
 
+let skipVersionCache = false;
+
 function createClient() {
   ensureWwebjs();
   const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE !== "0");
@@ -728,20 +730,25 @@ function createClient() {
     takeoverTimeoutMs: 0,
   };
 
-  ensureWaWebCache();
-  clientOptions.webVersion = WA_WEB_VERSION;
-  if (useRemoteCache) {
-    clientOptions.webVersionCache = {
-      type: "remote",
-      remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`,
-    };
-    console.log(`[WhatsApp] WA Web remote cache pinned: ${WA_WEB_VERSION}`);
+  if (skipVersionCache) {
+    clientOptions.webVersionCache = { type: "none" };
+    console.log("[WhatsApp] Using live WA Web (version cache bypassed).");
   } else {
-    clientOptions.webVersionCache = {
-      type: "local",
-      path: CACHE_DIR,
-    };
-    console.log(`[WhatsApp] WA Web local cache: ${WA_WEB_VERSION}`);
+    ensureWaWebCache();
+    clientOptions.webVersion = WA_WEB_VERSION;
+    if (useRemoteCache) {
+      clientOptions.webVersionCache = {
+        type: "remote",
+        remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`,
+      };
+      console.log(`[WhatsApp] WA Web remote cache pinned: ${WA_WEB_VERSION}`);
+    } else {
+      clientOptions.webVersionCache = {
+        type: "local",
+        path: CACHE_DIR,
+      };
+      console.log(`[WhatsApp] WA Web local cache: ${WA_WEB_VERSION}`);
+    }
   }
 
   return new Client(clientOptions);
@@ -885,14 +892,22 @@ async function destroyClient() {
   clearConnectPoll();
   clearRestoreWatchdog();
   clearQrStartupWatchdog();
-  if (!client) return;
-  try {
-    await client.destroy();
-  } catch (err) {
-    console.warn("[WhatsApp] Destroy:", err.message);
+  if (client) {
+    try {
+      await Promise.race([client.destroy(), sleep(5000)]);
+    } catch (err) {
+      console.warn("[WhatsApp] Destroy:", err.message);
+    }
+    client = null;
   }
-  client = null;
   pagePatchesApplied = false;
+  for (const lockName of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    try {
+      fs.rmSync(path.join(sessionDirPath(), lockName), { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function wipeAuthDir() {
@@ -981,10 +996,15 @@ async function initializeClient({ fresh = false, _retried = false } = {}) {
   } catch (err) {
     const errText = String(err?.message || err || "");
     const timedOut = errText === "INIT_TIMEOUT" || /timeout/i.test(errText);
-    const injectFailed = /inject|ExecutionContext|evaluate/i.test(`${errText}${err?.stack || ""}`);
+    const injectFailed = /inject|ExecutionContext|evaluate|Socket/i.test(`${errText}${err?.stack || ""}`);
     if (IS_HOSTED && !_retried && (timedOut || injectFailed || errText)) {
-      console.warn("[WhatsApp] Scanner init failed — retrying with remote WA Web cache (session kept)…", errText);
-      process.env.WHATSAPP_REMOTE_CACHE = "1";
+      if (/Socket/i.test(errText)) {
+        skipVersionCache = true;
+        console.warn("[WhatsApp] Socket init failed — retrying with live WA Web (no version cache)…");
+      } else {
+        console.warn("[WhatsApp] Scanner init failed — retrying with remote WA Web cache (session kept)…", errText);
+        process.env.WHATSAPP_REMOTE_CACHE = "1";
+      }
       await destroyClient();
       initInProgress = false;
       return initializeClient({ fresh, _retried: true });
