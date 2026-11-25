@@ -182,6 +182,9 @@ def init_db() -> None:
             )
         _run_schema_migrations(conn)
         _repair_bill_counter(conn)
+        from website_schema import ensure_website_schema
+
+        ensure_website_schema(conn)
         conn.commit()
 
 

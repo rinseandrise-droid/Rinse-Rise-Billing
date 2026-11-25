@@ -351,6 +351,12 @@ class DbConnection:
                 wrapper._insert_id = row["id"] if isinstance(row, dict) else row[0]
         return wrapper
 
+    def executemany(self, sql: str, params_seq: list[tuple] | list[list]) -> DbCursor:
+        sql = self._adapt_sql(sql)
+        cur = self._conn.cursor()
+        cur.executemany(sql, params_seq)
+        return DbCursor(cur, self._is_pg)
+
     def insert_returning_id(self, sql: str, params: tuple | list) -> int:
         if self._is_pg:
             base = self._adapt_sql(sql).rstrip().rstrip(";")
