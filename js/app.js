@@ -2856,9 +2856,12 @@ function buildWhatsAppBillMessage(bill) {
   message += `\n`;
   const offerBlock = formatOfferWhatsAppBlock(bill);
   if (offerBlock) message += offerBlock;
+  message += `*TOTAL: ${total}*\n`;
+  if (bill?.id && window.location?.origin && !/^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname || "")) {
+    message += `\nInvoice PDF: ${window.location.origin}/api/bills/${bill.id}/invoice.pdf\n`;
+  }
   message +=
-    `*TOTAL: ${total}*\n\n` +
-    `Thank you for choosing us!\n` +
+    `\nThank you for choosing us!\n` +
     `Rinse - Rise - Repeat\n` +
     `Call: 9591506548 | 9 AM - 9 PM` +
     googleReviewMessageBlock();
@@ -2924,6 +2927,22 @@ function showWhatsAppToast(html, durationMs = 7000) {
   showWhatsAppToast._timer = setTimeout(() => toast.classList.add("hidden"), durationMs);
 }
 
+function triggerInvoicePdfDownload(billId) {
+  if (!billId || !API?.fetchBillInvoicePdf) return;
+  void API.fetchBillInvoicePdf(billId)
+    .then(({ blob, filename }) => {
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    })
+    .catch(() => {});
+}
+
 async function shareBillOnWhatsApp(phone, bill, { targetWindow = null } = {}) {
   if (!bill?.id) {
     throw new Error("Bill must be saved before sending on WhatsApp.");
@@ -2932,6 +2951,7 @@ async function shareBillOnWhatsApp(phone, bill, { targetWindow = null } = {}) {
   stopPendingWhatsAppWatcher();
   pendingWhatsAppBillId = null;
 
+  triggerInvoicePdfDownload(bill.id);
   const message = buildWhatsAppBillMessage(bill);
   const url = buildWhatsAppWebUrl(phone, message);
 
