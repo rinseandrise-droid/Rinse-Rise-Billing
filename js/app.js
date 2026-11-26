@@ -2823,6 +2823,16 @@ function formatDeliveryScheduleFromBill(bill) {
   return part || "—";
 }
 
+function buildWhatsAppWebUrl(phone, message) {
+  const digits = formatPhoneForWhatsApp(phone);
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+  const base = isMobile
+    ? `https://wa.me/${encodeURIComponent(digits)}`
+    : `https://web.whatsapp.com/send?phone=${encodeURIComponent(digits)}`;
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}text=${encodeURIComponent(message || "")}`;
+}
+
 function buildWhatsAppBillMessage(bill) {
   const name = bill.customerName?.trim() || "Customer";
   const delivery = formatDeliveryScheduleFromBill(bill);
@@ -2830,21 +2840,28 @@ function buildWhatsAppBillMessage(bill) {
 
   let message =
     `Hi ${name},\n\n` +
-    `Your invoice from *Rinse & Rise Laundryrite* is attached.\n\n` +
+    `Here is your invoice from *Rinse & Rise Laundryrite*.\n\n` +
     `Bill No: *#${bill.billNo}*\n` +
     `Delivery: ${delivery}\n\n` +
     `*Items:*\n`;
 
   (bill.items || []).forEach((item, i) => {
-    message += `${i + 1}. ${item.name}\n`;
+    const qtyText = item.unit === "kg" ? `${item.qty} kg` : `${item.qty} pc`;
+    const lineAmt = formatCurrency(
+      (Number(item.rate) || 0) * (Number(item.qty) || 0) + (Number(item.starchExtra) || 0)
+    ).replace("\u20B9", "Rs. ");
+    message += `${i + 1}. ${item.name} (${qtyText}) - ${lineAmt}\n`;
   });
 
   message += `\n`;
   const offerBlock = formatOfferWhatsAppBlock(bill);
   if (offerBlock) message += offerBlock;
+  message += `*TOTAL: ${total}*\n`;
+  if (bill?.id && window.location?.origin && !/^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname || "")) {
+    message += `\nInvoice PDF: ${window.location.origin}/api/bills/${bill.id}/invoice.pdf\n`;
+  }
   message +=
-    `*TOTAL: ${total}*\n\n` +
-    `Thank you for choosing us!\n` +
+    `\nThank you for choosing us!\n` +
     `Rinse - Rise - Repeat\n` +
     `Call: 9591506548 | 9 AM - 9 PM` +
     googleReviewMessageBlock();
@@ -2910,7 +2927,23 @@ function showWhatsAppToast(html, durationMs = 7000) {
   showWhatsAppToast._timer = setTimeout(() => toast.classList.add("hidden"), durationMs);
 }
 
-async function shareBillOnWhatsApp(phone, bill, { skipPaymentValidation = false } = {}) {
+function triggerInvoicePdfDownload(billId) {
+  if (!billId || !API?.fetchBillInvoicePdf) return;
+  void API.fetchBillInvoicePdf(billId)
+    .then(({ blob, filename }) => {
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    })
+    .catch(() => {});
+}
+
+async function shareBillOnWhatsApp(phone, bill, { targetWindow = null } = {}) {
   if (!bill?.id) {
     throw new Error("Bill must be saved before sending on WhatsApp.");
   }
@@ -2918,68 +2951,39 @@ async function shareBillOnWhatsApp(phone, bill, { skipPaymentValidation = false 
   stopPendingWhatsAppWatcher();
   pendingWhatsAppBillId = null;
 
-  let result;
-  try {
-    result = await sendBillWhatsAppWithRetry(bill.id, { skipPaymentValidation });
-  } catch (err) {
-    throw new Error(err.message || "Could not reach WhatsApp service.");
-  }
+  triggerInvoicePdfDownload(bill.id);
+  const message = buildWhatsAppBillMessage(bill);
+  const url = buildWhatsAppWebUrl(phone, message);
 
-  if (result.sent) {
-    showWhatsAppToast(
-      billWasSentOnWhatsApp(bill)
-        ? "<strong>Invoice sent again!</strong>The PDF invoice was delivered on WhatsApp once more."
-        : "<strong>Invoice PDF sent!</strong>The PDF invoice was delivered on WhatsApp."
-    );
-    refreshWhatsAppStatus();
-    return true;
-  }
-
-  if (result.reason === "not_connected") {
-    pendingWhatsAppBillId = bill.id;
-    const status = await API.getWhatsAppStatus(true).catch(() => null);
-    if (isWhatsAppSessionRestoring(status)) {
-      showWhatsAppToast(
-        "<strong>WhatsApp reconnecting</strong>Saved session is restoring — bill will send automatically when ready."
-      );
-    } else if (whatsAppNeedsQrScan(status)) {
-      openWhatsAppConnectModal();
-      showWhatsAppToast(
-        "<strong>Link WhatsApp once</strong>Scan the QR code — you won't need to scan again on this computer."
-      );
-    } else {
-      openWhatsAppConnectModal();
-      showWhatsAppToast(
-        "<strong>WhatsApp starting</strong>Wait a moment — saved session will restore without scanning if already linked."
-      );
-    }
-    startPendingWhatsAppWatcher(bill.id);
-    return false;
-  }
-
-  if (result.reason === "send_failed" && result.error) {
-    const needsReconnect =
-      result.needsReconnect || isWhatsAppReconnectError(result.error);
-    if (needsReconnect) {
-      pendingWhatsAppBillId = bill.id;
-      const status = await API.getWhatsAppStatus().catch(() => null);
-      if (whatsAppNeedsQrScan(status)) {
-        openWhatsAppConnectModal();
-        showWhatsAppToast(
-          "<strong>Scan QR to re-link</strong>Session expired on the server — scan once, then send again."
-        );
-      } else {
-        showWhatsAppToast(
-          "<strong>WhatsApp reconnecting</strong>Please wait — trying saved session before asking for QR."
-        );
+  let navigated = false;
+  if (targetWindow) {
+    try {
+      if (!targetWindow.closed) {
+        targetWindow.location.href = url;
+        targetWindow.focus();
+        navigated = true;
       }
-      startPendingWhatsAppWatcher(bill.id);
-      return false;
+    } catch {
+      navigated = false;
     }
-    throw new Error(result.error);
+  }
+  if (!navigated) {
+    const opened = window.open(url, "rinse_whatsapp_web");
+    if (opened) {
+      try {
+        opened.focus();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      window.location.href = url;
+    }
   }
 
-  throw new Error("Could not send invoice PDF on WhatsApp.");
+  showWhatsAppToast(
+    "<strong>Opening WhatsApp Web…</strong>Your bill message is pre-filled and ready to send."
+  );
+  return true;
 }
 
 let whatsAppStatusTimer = null;
@@ -5326,19 +5330,12 @@ async function sendHistoryWhatsApp(bill, btn, { skipPaymentValidation = false } 
     return;
   }
   try {
-    await withButtonLoading(btn, async () => {
-      setSectionLoading(els.historyView, true, "Sending on WhatsApp…");
-      try {
-        await shareBillOnWhatsApp(phone, bill, { skipPaymentValidation: true });
-        const updated = { ...bill, sentVia: "whatsapp" };
-        upsertBillInCache(updated);
-        selectedHistoryId = updated.id;
-        renderHistoryList();
-        renderHistoryDetail(updated);
-      } finally {
-        setSectionLoading(els.historyView, false);
-      }
-    }, "Sending…");
+    await shareBillOnWhatsApp(phone, bill);
+    const updated = { ...bill, sentVia: "whatsapp" };
+    upsertBillInCache(updated);
+    selectedHistoryId = updated.id;
+    renderHistoryList();
+    renderHistoryDetail(updated);
   } catch (err) {
     const block = parseWhatsAppSendError(err.message);
     if (block && /payment type|payment info/i.test(err.message || "")) {
@@ -5561,27 +5558,35 @@ async function sendWhatsApp() {
     return;
   }
 
+  const waWin = window.open("", "rinse_whatsapp_web");
   try {
     await withButtonLoading(els.whatsappBtn, async () => {
-      setSectionLoading(els.billingView, true, "Saving & sending on WhatsApp…");
-      try {
-        buildReceipt();
-        const saved = await saveBillToDatabase("whatsapp", {
-          refreshHistory: false,
-          deliveryStatus: "done",
-          completedAt: new Date().toISOString(),
-        });
-        if (!saved?.id) return;
-
-        const sent = await shareBillOnWhatsApp(phone, saved, { skipPaymentValidation: true });
-        if (sent) {
-          resetBillForm();
+      buildReceipt();
+      const saved = await saveBillToDatabase("whatsapp", {
+        refreshHistory: false,
+        deliveryStatus: "done",
+        completedAt: new Date().toISOString(),
+      });
+      if (!saved?.id) {
+        try {
+          if (waWin && !waWin.closed) waWin.close();
+        } catch {
+          /* ignore */
         }
-      } finally {
-        setSectionLoading(els.billingView, false);
+        return;
       }
-    }, "Sending…");
+
+      const sent = await shareBillOnWhatsApp(phone, saved, { targetWindow: waWin });
+      if (sent) {
+        resetBillForm();
+      }
+    }, "Opening…");
   } catch (err) {
+    try {
+      if (waWin && !waWin.closed) waWin.close();
+    } catch {
+      /* ignore */
+    }
     const block = parseWhatsAppSendError(err.message);
     if (block) {
       showWhatsAppValidationAlert(block);
