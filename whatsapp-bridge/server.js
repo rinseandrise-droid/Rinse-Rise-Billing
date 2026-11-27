@@ -1,67 +1,28 @@
 /**
- * Local WhatsApp bridge — sends PDF invoices via your logged-in WhatsApp Web session.
- * Run once, scan QR code, then bills can be sent automatically from the billing app.
+ * Lightweight WhatsApp bridge powered by @whiskeysockets/baileys (no Chromium).
+ * Exposes the same HTTP API on localhost for the Flask billing backend.
  */
 const express = require("express");
-const path = require("path");
 const fs = require("fs");
+const path = require("path");
+const pino = require("pino");
+const QRCode = require("qrcode");
 
-/** Lazy-load heavy deps so /health responds within seconds on Railway. */
-let Client = null;
-let LocalAuth = null;
-let MessageMedia = null;
-let QRCode = null;
-let wwebjsLoaded = false;
-
-function ensureWwebjs() {
-  if (wwebjsLoaded) return;
-  ({ Client, LocalAuth, MessageMedia } = require("whatsapp-web.js"));
-  QRCode = require("qrcode");
-  wwebjsLoaded = true;
-  console.log("[WhatsApp] Libraries loaded.");
-}
-
-process.on("uncaughtException", (err) => {
-  console.error("[WhatsApp] Uncaught exception:", err?.message || err);
-  state.phase = "error";
-  state.lastError = `Scanner crashed: ${err?.message || err}. Restarting…`;
-  initInProgress = false;
-  setTimeout(() => {
-    forceFreshQrLink("uncaught", { wipeAuth: false }).catch((e) =>
-      console.error("[WhatsApp] Recovery failed:", e.message)
-    );
-  }, 2000);
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("[WhatsApp] Unhandled rejection:", reason);
-});
+const app = express();
+app.use(express.json({ limit: "25mb" }));
 
 const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT || 3001);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
-const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || path.join(DATA_DIR, "whatsapp-auth");
-const CACHE_DIR = process.env.WHATSAPP_CACHE_DIR || path.join(DATA_DIR, "whatsapp-cache");
-const LEGACY_AUTH_DIR = path.join(__dirname, ".wwebjs_auth");
-const IS_HOSTED = Boolean(
-  process.env.RAILWAY_ENVIRONMENT || process.env.PUPPETEER_EXECUTABLE_PATH
+const DATA_DIR = path.resolve(
+  process.env.DATA_DIR || path.join(__dirname, "..", "data")
 );
-
-/**
- * Pin a known WhatsApp Web HTML (kept under CACHE_DIR). The `ready` event
- * often never fires on multi-device WA Web — we treat CONNECTED state as ready.
- */
-const WA_WEB_VERSION =
-  process.env.WHATSAPP_WEB_VERSION || "2.3000.1048579041-alpha";
-const BUNDLED_CACHE_DIR = path.join(__dirname, "wa-cache");
-
-const AUTH_READY_TIMEOUT_MS = Number(
-  process.env.WHATSAPP_AUTH_TIMEOUT_MS || (IS_HOSTED ? 420000 : 180000)
+const AUTH_DIR = path.resolve(
+  process.env.WHATSAPP_AUTH_DIR || path.join(DATA_DIR, "whatsapp-auth")
 );
-const RESTORE_QR_GRACE_MS = Number(process.env.WHATSAPP_RESTORE_GRACE_MS || 15000);
-const RESTORE_FAIL_MS = Number(process.env.WHATSAPP_RESTORE_FAIL_MS || (IS_HOSTED ? 300000 : 150000));
-const QR_STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS || (IS_HOSTED ? 180000 : 120000));
-const INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || (IS_HOSTED ? 60000 : 90000));
 const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "rinse-rise";
+const BAILEYS_AUTH_DIR = path.join(AUTH_DIR, `baileys-${CLIENT_ID}`);
+const LOCK_FILE = path.join(AUTH_DIR, ".bridge.lock");
+const IS_HOSTED = Boolean(process.env.RAILWAY_ENVIRONMENT);
+const SEND_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || 45000);
 
 const state = {
   ready: false,
@@ -69,1056 +30,86 @@ const state = {
   lastError: null,
   phase: "booting",
   loadingPercent: 0,
-  authenticatingSince: null,
   waState: null,
+  authenticatingSince: null,
   sessionLinked: false,
   qrGeneration: 0,
 };
 
-let authTimer = null;
-let connectPollTimer = null;
-let restoreWatchdogTimer = null;
-let qrStartupTimer = null;
-let qrDuringRestoreCount = 0;
-let client = null;
-let recovering = false;
-let sendInProgress = false;
-let sendInProgressSince = 0;
-let sendLockToken = 0;
-const SEND_LOCK_MAX_MS = Number(process.env.WHATSAPP_SEND_LOCK_MS || (IS_HOSTED ? 130000 : 90000));
-const SEND_OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_TIMEOUT_MS || (IS_HOSTED ? 120000 : 90000));
-const SEND_LOCK_FORCE_CLEAR_MS = Number(process.env.WHATSAPP_SEND_FORCE_CLEAR_MS || 25000);
-const GET_NUMBER_ID_TIMEOUT_MS = Number(
-  process.env.WHATSAPP_NUMBER_LOOKUP_MS || (IS_HOSTED ? 12000 : 5000)
-);
-
-const LOCK_FILE = path.join(AUTH_DIR, ".bridge.lock");
-const SESSION_LINKED_FILE = path.join(AUTH_DIR, ".session-linked");
-let lastReconnectAt = 0;
+let sock = null;
+let baileysMod = null;
 let bridgeStartedAt = Date.now();
 let initInProgress = false;
-let freshQrInFlight = false;
-
-function ensureAuthDirs() {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
-
-/** Ship a pinned WA Web HTML in the repo so hosted deploys never fetch a broken remote build. */
-function ensureWaWebCache() {
-  ensureAuthDirs();
-  const target = path.join(CACHE_DIR, `${WA_WEB_VERSION}.html`);
-  const bundled = path.join(BUNDLED_CACHE_DIR, `${WA_WEB_VERSION}.html`);
-  if (!fs.existsSync(bundled)) {
-    console.warn(`[WhatsApp] Bundled WA Web HTML missing: ${bundled}`);
-    return;
-  }
-  const needsCopy =
-    !fs.existsSync(target) || fs.statSync(bundled).size !== fs.statSync(target).size;
-  if (needsCopy) {
-    fs.copyFileSync(bundled, target);
-    console.log(`[WhatsApp] Seeded WA Web cache: ${WA_WEB_VERSION}`);
-  }
-}
-
-/** Clear WA Web HTML cache only — keeps whatsapp-auth session so QR scan is one-time. */
-function clearWaWebHtmlCacheOnly() {
-  try {
-    ensureAuthDirs();
-    for (const name of fs.readdirSync(CACHE_DIR)) {
-      if (name.endsWith(".html")) {
-        fs.unlinkSync(path.join(CACHE_DIR, name));
-      }
-    }
-    ensureWaWebCache();
-    console.log("[WhatsApp] Refreshed WA Web HTML cache (session data kept).");
-  } catch (err) {
-    console.warn("[WhatsApp] WA Web cache refresh:", err.message);
-  }
-}
-
-function clearQrStartupWatchdog() {
-  if (qrStartupTimer) {
-    clearTimeout(qrStartupTimer);
-    qrStartupTimer = null;
-  }
-}
-
-function scheduleQrStartupWatchdog() {
-  clearQrStartupWatchdog();
-  qrStartupTimer = setTimeout(() => {
-    if (state.ready || state.qr) return;
-    console.warn("[WhatsApp] No QR yet — restarting scanner (keeping saved session)…");
-    void forceFreshQrLink("qr-startup-timeout", { wipeAuth: false });
-  }, QR_STARTUP_TIMEOUT_MS);
-}
-
-function clearRestoreWatchdog() {
-  if (restoreWatchdogTimer) {
-    clearTimeout(restoreWatchdogTimer);
-    restoreWatchdogTimer = null;
-  }
-}
-
-function scheduleRestoreWatchdog() {
-  clearRestoreWatchdog();
-  if (!hasSessionLinked()) return;
-  restoreWatchdogTimer = setTimeout(() => {
-    if (state.ready) return;
-    console.warn("[WhatsApp] Saved session did not restore in time — fresh QR required…");
-    void forceFreshQrLink("restore-timeout", { wipeAuth: true });
-  }, RESTORE_FAIL_MS);
-}
-
-async function forceFreshQrLink(reason, { wipeAuth = false } = {}) {
-  if (freshQrInFlight) return;
-  freshQrInFlight = true;
-  if (IS_HOSTED && reason === "qr-startup-timeout") {
-    process.env.WHATSAPP_REMOTE_CACHE = "1";
-  }
-  clearRestoreWatchdog();
-  clearQrStartupWatchdog();
-  if (wipeAuth) {
-    clearSessionLinked();
-  }
-  state.ready = false;
-  state.qr = null;
-  state.phase = wipeAuth ? "starting" : "restoring";
-  state.lastError = wipeAuth
-    ? "Generating QR code — keep this window open…"
-    : "Restoring saved WhatsApp session…";
-  qrDuringRestoreCount = 0;
-  console.warn(`[WhatsApp] Scanner restart (${reason}, wipeAuth=${wipeAuth})`);
-  try {
-    await destroyClient();
-    await initializeClient({ fresh: wipeAuth });
-  } catch (err) {
-    state.phase = "error";
-    state.lastError = err.message || "Could not restart WhatsApp scanner.";
-    console.error("[WhatsApp] Fresh QR restart failed:", err.message);
-  } finally {
-    freshQrInFlight = false;
-  }
-}
-
-/** Move session from old whatsapp-bridge/.wwebjs_auth to data/whatsapp-auth once. */
-function migrateLegacyAuthDir() {
-  if (!LEGACY_AUTH_DIR || path.resolve(LEGACY_AUTH_DIR) === path.resolve(AUTH_DIR)) return;
-  try {
-    const legacySession = path.join(LEGACY_AUTH_DIR, "session-rinse-rise");
-    const newSession = path.join(AUTH_DIR, "session-rinse-rise");
-    if (fs.existsSync(legacySession) && !fs.existsSync(newSession)) {
-      console.log("[WhatsApp] Migrating saved session to persistent data folder…");
-      fs.cpSync(LEGACY_AUTH_DIR, AUTH_DIR, { recursive: true });
-    } else if (fs.existsSync(path.join(LEGACY_AUTH_DIR, ".session-linked")) && !hasSessionLinked()) {
-      fs.copyFileSync(
-        path.join(LEGACY_AUTH_DIR, ".session-linked"),
-        path.join(AUTH_DIR, ".session-linked")
-      );
-    }
-  } catch (err) {
-    console.warn("[WhatsApp] Legacy auth migration:", err.message);
-  }
-}
-
-function markSessionLinked() {
-  try {
-    ensureAuthDirs();
-    fs.writeFileSync(SESSION_LINKED_FILE, new Date().toISOString());
-    state.sessionLinked = true;
-  } catch {
-    /* ignore */
-  }
-}
-
-function clearSessionLinked() {
-  try {
-    if (fs.existsSync(SESSION_LINKED_FILE)) fs.unlinkSync(SESSION_LINKED_FILE);
-  } catch {
-    /* ignore */
-  }
-  state.sessionLinked = false;
-}
-
-function hasSessionLinked() {
-  return fs.existsSync(SESSION_LINKED_FILE);
-}
-
-function processAlive(pid) {
-  if (!pid || Number.isNaN(pid)) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function acquireSingleInstanceLock() {
-  ensureAuthDirs();
-  if (fs.existsSync(LOCK_FILE)) {
-    const existing = parseInt(String(fs.readFileSync(LOCK_FILE, "utf8")).trim(), 10);
-    if (processAlive(existing) && existing !== process.pid) {
-      console.error(`[WhatsApp] Bridge already running (pid ${existing}). Exiting duplicate.`);
-      process.exit(0);
-    }
-    fs.unlinkSync(LOCK_FILE);
-  }
-  fs.writeFileSync(LOCK_FILE, String(process.pid));
-}
-
-function releaseSingleInstanceLock() {
-  try {
-    if (fs.existsSync(LOCK_FILE)) {
-      const existing = parseInt(String(fs.readFileSync(LOCK_FILE, "utf8")).trim(), 10);
-      if (existing === process.pid) fs.unlinkSync(LOCK_FILE);
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
-/** Hosted: system Chromium (fastest on Docker). Local Windows: system Chrome/Edge. */
-function resolveChromePath() {
-  if (IS_HOSTED) {
-    const candidates = [
-      process.env.PUPPETEER_EXECUTABLE_PATH,
-      "/usr/bin/chromium",
-      "/usr/bin/chromium-browser",
-      "/usr/bin/google-chrome-stable",
-    ].filter(Boolean);
-    for (const candidate of candidates) {
-      try {
-        if (fs.existsSync(candidate)) return candidate;
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      const puppeteer = require("puppeteer");
-      const bundled = puppeteer.executablePath();
-      if (bundled && fs.existsSync(bundled)) return bundled;
-    } catch (err) {
-      console.warn("[WhatsApp] Puppeteer bundled Chrome lookup:", err.message);
-    }
-    return "";
-  }
-
-  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  const candidates = [
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
-    process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
-    process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      /* ignore */
-    }
-  }
-  return "";
-}
-
-let chromePathCache = null;
-function getChromePath() {
-  if (chromePathCache === null) {
-    chromePathCache = resolveChromePath();
-  }
-  return chromePathCache;
-}
-
-function resetChromePathCache() {
-  chromePathCache = null;
-}
-
-const app = express();
-app.use(express.json({ limit: "2mb" }));
-
-function clearConnectPoll() {
-  if (connectPollTimer) {
-    clearInterval(connectPollTimer);
-    connectPollTimer = null;
-  }
-}
-
-function markReady(source) {
-  clearTimeout(authTimer);
-  clearConnectPoll();
-  clearRestoreWatchdog();
-  clearQrStartupWatchdog();
-  state.qr = null;
-  state.qrGeneration = 0;
-  qrDuringRestoreCount = 0;
-  state.lastError = null;
-  state.loadingPercent = 100;
-  state.phase = "connecting";
-  state.authenticatingSince = null;
-  markSessionLinked();
-  console.log(`[WhatsApp] CONNECTED (${source}) — waiting for chat store & comms…`);
-
-  waitForFullyReady(90000)
-    .then((ok) => {
-      if (ok) {
-        state.phase = "ready";
-        state.ready = true;
-        state.lastError = null;
-        console.log(`[WhatsApp] Connected and ready (${source}).`);
-        applyWhatsAppPagePatches().catch((err) =>
-          console.warn("[WhatsApp] Page patch deferred:", err.message)
-        );
-        return;
-      }
-      state.phase = "loading";
-      state.ready = false;
-      state.lastError =
-        "WhatsApp linked — still finishing setup. Wait about 1 minute, then try sending again.";
-      startStoreReadyPoll();
-    })
-    .catch((err) => {
-      console.warn("[WhatsApp] Store wait failed:", err.message);
-      state.phase = "loading";
-      state.ready = false;
-      state.lastError = "WhatsApp linked — still starting up. Wait a minute and try again.";
-      startStoreReadyPoll();
-    });
-}
-
-function startConnectedPoll(waClient) {
-  clearConnectPoll();
-  let connectedTicks = 0;
-  connectPollTimer = setInterval(async () => {
-    if (state.ready || !waClient) {
-      clearConnectPoll();
-      return;
-    }
-    try {
-      const waState = await waClient.getState();
-      state.waState = waState || null;
-      if (waState === "CONNECTED") {
-        connectedTicks += 1;
-        // Require CONNECTED twice in a row (~4s) — ready event often never fires
-        // on newer WA Web builds, but state still settles to CONNECTED.
-        if (connectedTicks >= 2) {
-          markReady("state-poll");
-        }
-      } else {
-        connectedTicks = 0;
-      }
-    } catch (err) {
-      console.warn("[WhatsApp] State poll:", err.message);
-    }
-  }, 2000);
-}
-
-function scheduleAuthTimeout() {
-  clearTimeout(authTimer);
-  authTimer = setTimeout(async () => {
-    if (state.ready) return;
-
-    // Last chance: if WhatsApp already says CONNECTED, force ready.
-    try {
-      if (client) {
-        const waState = await client.getState();
-        state.waState = waState || null;
-        if (waState === "CONNECTED") {
-          markReady("auth-timeout-connected");
-          return;
-        }
-      }
-    } catch (err) {
-      console.warn("[WhatsApp] Auth timeout getState:", err.message);
-    }
-
-    state.phase = "error";
-    state.lastError =
-      "Phone linked but WhatsApp Web did not finish loading. Click Reset & Scan Again, wait for a fresh QR, scan quickly, then keep this window open for up to 3 minutes.";
-    console.error("[WhatsApp] Ready timed out after authentication.");
-    clearConnectPoll();
-  }, AUTH_READY_TIMEOUT_MS);
-}
+let reconnectTimer = null;
+let sendInProgress = false;
+let sendInProgressSince = 0;
+let sendQueue = Promise.resolve();
+let socketGeneration = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function clearSendLockIfStale() {
-  if (!sendInProgress) return;
-  if (Date.now() - sendInProgressSince > SEND_LOCK_MAX_MS) {
-    console.warn("[WhatsApp] Cleared stale send lock after timeout.");
-    sendLockToken += 1;
-    sendInProgress = false;
-    sendInProgressSince = 0;
-  }
-}
-
-function acquireSendLock() {
-  clearSendLockIfStale();
-  if (sendInProgress) return 0;
-  sendInProgress = true;
-  sendInProgressSince = Date.now();
-  sendLockToken += 1;
-  return sendLockToken;
-}
-
-function releaseSendLock(token) {
-  if (token && token !== sendLockToken) return;
-  sendLockToken += 1;
-  sendInProgress = false;
-  sendInProgressSince = 0;
-}
-
-async function waitForSendLock(maxWaitMs = 40000) {
-  const started = Date.now();
-  while (Date.now() - started < maxWaitMs) {
-    const token = acquireSendLock();
-    if (token) return token;
-    await sleep(500);
-  }
-  console.warn("[WhatsApp] Previous send still running — taking over the send slot.");
-  sendLockToken += 1;
-  sendInProgress = true;
-  sendInProgressSince = Date.now();
-  return sendLockToken;
-}
-
-function sendBusyResponse(res) {
-  clearSendLockIfStale();
-  const busyForMs = sendInProgressSince ? Date.now() - sendInProgressSince : 0;
-  if (sendInProgress && busyForMs > SEND_LOCK_FORCE_CLEAR_MS) {
-    console.warn("[WhatsApp] Force-clearing stuck send lock.");
-    releaseSendLock();
-    return res.status(503).json({
-      error: "Previous send took too long — please tap Send again.",
-      retryAfterSec: 1,
-    });
-  }
-  if (!sendInProgress) {
-    return res.status(503).json({
-      error: "WhatsApp send slot was busy but is free now — please try again.",
-      retryAfterSec: 1,
-    });
-  }
-  const busyForSec = Math.max(1, Math.ceil(busyForMs / 1000));
-  return res.status(429).json({
-    error: "WhatsApp is finishing the previous send — wait a few seconds and try again.",
-    retryAfterSec: Math.min(10, Math.max(2, 8 - busyForSec)),
-    busyForSec,
-  });
-}
-
-async function withSendTimeout(promise, label = "send") {
-  let timer = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(`WhatsApp ${label} timed out after ${Math.round(SEND_OPERATION_TIMEOUT_MS / 1000)}s. Try again.`));
-        }, SEND_OPERATION_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-function isCommsError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return (
-    msg.includes("startcomms") ||
-    msg.includes("sendiq") ||
-    msg.includes("[comms]") ||
-    msg.includes("not ready")
-  );
-}
-
-function isLidError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return msg.includes("lid is missing") || msg.includes("no lid for user");
-}
-
-function isContactGetterError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return (
-    msg.includes("data passed to getter") ||
-    msg.includes("memoize") ||
-    msg.includes("getcontact") ||
-    (msg.includes("evaluation failed") && msg.includes("undefined"))
-  );
-}
-
-function isSessionError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return (
-    isCommsError(err) ||
-    isStoreError(err) ||
-    msg.includes("detached frame") ||
-    msg.includes("target closed") ||
-    msg.includes("session closed") ||
-    msg.includes("protocol error") ||
-    msg.includes("execution context was destroyed") ||
-    msg.includes("page has been closed") ||
-    msg.includes("browser has disconnected")
-  );
-}
-
-function isStoreError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return (
-    err?.code === "STORE_NOT_READY" ||
-    msg.includes("getchat") ||
-    msg.includes("cannot read properties of undefined") ||
-    msg.includes("chat store") ||
-    msg.includes("still loading")
-  );
-}
-
-async function isWhatsAppStoreReady() {
-  if (!client?.pupPage) return false;
-  try {
-    return await client.pupPage.evaluate(() => {
-      try {
-        const collections = window.require?.("WAWebCollections");
-        const chat = collections?.Chat;
-        return Boolean(chat && typeof chat.get === "function");
-      } catch {
-        return false;
-      }
-    });
-  } catch {
-    return false;
-  }
-}
-
-async function waitForStoreReady(timeoutMs = 60000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (await isWhatsAppStoreReady()) return true;
-    await sleep(1000);
-  }
-  return false;
-}
-
-/** sendIq fails with startComms if the socket layer is not up yet. */
-async function isCommsReady() {
-  if (!client?.pupPage) return false;
-  try {
-    return await client.pupPage.evaluate(() => {
-      try {
-        const Conn = window.require?.("WAWebConnModel")?.Conn;
-        if (Conn?.connected || Conn?.wid) return true;
-        const me = window.require?.("WAWebUserPrefsMeUser")?.getMaybeMePnUser?.();
-        if (me) return true;
-        const stream = window.require?.("WAWebStreamModel")?.Stream;
-        if (stream?.mode === "MAIN" || stream?.uiActive) return true;
-        return false;
-      } catch {
-        return false;
-      }
-    });
-  } catch {
-    return false;
-  }
-}
-
-async function waitForCommsReady(timeoutMs = 45000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (await isCommsReady()) return true;
-    await sleep(1500);
-  }
-  return false;
-}
-
-async function waitForFullyReady(timeoutMs = 90000) {
-  const storeOk = await waitForStoreReady(Math.min(timeoutMs, 60000));
-  if (!storeOk) return false;
-  const commsOk = await waitForCommsReady(Math.min(timeoutMs, 45000));
-  if (!commsOk) {
-    // Hosted Chrome often needs a short grace period after the chat store loads.
-    await sleep(8000);
-  } else {
-    await sleep(2500);
-  }
-  return (await isWhatsAppStoreReady()) && (await isCommsReady());
-}
-
-function startStoreReadyPoll() {
-  if (startStoreReadyPoll._timer) return;
-  startStoreReadyPoll._timer = setInterval(async () => {
-    if (state.ready || !client) {
-      clearInterval(startStoreReadyPoll._timer);
-      startStoreReadyPoll._timer = null;
-      return;
-    }
-    try {
-      if (await isWhatsAppStoreReady() && (await isCommsReady())) {
-        state.phase = "ready";
-        state.ready = true;
-        state.lastError = null;
-        console.log("[WhatsApp] Chat store & comms ready.");
-        clearInterval(startStoreReadyPoll._timer);
-        startStoreReadyPoll._timer = null;
-      }
-    } catch (err) {
-      console.warn("[WhatsApp] Store poll:", err.message);
-    }
-  }, 2000);
-}
-
-function sessionDirPath() {
-  return path.join(AUTH_DIR, `session-${CLIENT_ID}`);
-}
-
-function validateHostedChrome() {
-  if (!IS_HOSTED) return true;
-  const chromePath = getChromePath();
-  if (chromePath && fs.existsSync(chromePath)) {
-    console.log(`[WhatsApp] Using Chrome: ${chromePath}`);
-    return true;
-  }
-  state.phase = "error";
-  state.lastError =
-    "WhatsApp scanner could not find Chrome on the server. Redeploy the billing app and try again.";
-  console.error("[WhatsApp] Chrome binary missing on hosted server.");
-  return false;
-}
-
-let skipVersionCache = false;
-
-function createClient() {
-  ensureWwebjs();
-  const useRemoteCache = Boolean(IS_HOSTED && process.env.WHATSAPP_REMOTE_CACHE !== "0");
-  const puppeteerConfig = {
-    headless: true,
-    protocolTimeout: 120000,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      ...(IS_HOSTED ? ["--no-zygote"] : []),
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-first-run",
-      "--mute-audio",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
-      "--disable-ipc-flooding-protection",
-      "--disable-renderer-backgrounding",
-      "--disable-background-timer-throttling",
-      "--disable-software-rasterizer",
-      "--window-size=1280,720",
-    ],
-  };
-  const chromePath = getChromePath();
-  if (chromePath) {
-    puppeteerConfig.executablePath = chromePath;
-  }
-
-  const clientOptions = {
-    authStrategy: new LocalAuth({ dataPath: AUTH_DIR, clientId: CLIENT_ID }),
-    puppeteer: puppeteerConfig,
-    takeoverOnConflict: false,
-    takeoverTimeoutMs: 0,
-  };
-
-  if (skipVersionCache) {
-    clientOptions.webVersionCache = { type: "none" };
-    console.log("[WhatsApp] Using live WA Web (version cache bypassed).");
-  } else {
-    ensureWaWebCache();
-    clientOptions.webVersion = WA_WEB_VERSION;
-    if (useRemoteCache) {
-      clientOptions.webVersionCache = {
-        type: "remote",
-        remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`,
-      };
-      console.log(`[WhatsApp] WA Web remote cache pinned: ${WA_WEB_VERSION}`);
-    } else {
-      clientOptions.webVersionCache = {
-        type: "local",
-        path: CACHE_DIR,
-      };
-      console.log(`[WhatsApp] WA Web local cache: ${WA_WEB_VERSION}`);
-    }
-  }
-
-  return new Client(clientOptions);
-}
-
-function bindClientEvents(waClient) {
-  waClient.on("qr", async (qr) => {
-    state.ready = false;
-    state.authenticatingSince = null;
-    clearTimeout(authTimer);
-    clearRestoreWatchdog();
-
-    const linked = hasSessionLinked() || fs.existsSync(sessionDirPath());
-    let restoreGraceExpired = true;
-    if (linked && RESTORE_QR_GRACE_MS > 0) {
-      restoreGraceExpired = Date.now() - bridgeStartedAt >= RESTORE_QR_GRACE_MS;
-      if (!restoreGraceExpired) {
-        qrDuringRestoreCount += 1;
-        if (qrDuringRestoreCount <= 1) {
-          state.phase = "restoring";
-          state.qr = null;
-          state.lastError = "Restoring saved WhatsApp session — no scan needed if already linked.";
-          console.log("[WhatsApp] QR during restore grace — waiting for saved session…");
-          startConnectedPoll(waClient);
-          return;
-        }
-      }
-    }
-    if (linked && restoreGraceExpired) {
-      clearSessionLinked();
-    }
-
-    state.phase = "qr";
-    state.loadingPercent = 0;
-    state.lastError = null;
-    try {
-      clearQrStartupWatchdog();
-      state.qrGeneration += 1;
-      state.qr = await QRCode.toDataURL(qr, { margin: 2, width: 360, errorCorrectionLevel: "H" });
-      console.log(`[WhatsApp] QR ready (#${state.qrGeneration}) — scan in billing app.`);
-    } catch (err) {
-      state.lastError = "Could not render QR code.";
-      console.error("[WhatsApp] QR render failed:", err.message);
-    }
-  });
-
-  waClient.on("loading_screen", (percent, message) => {
-    state.loadingPercent = Number(percent) || 0;
-    if (state.phase === "qr" && state.qr && !state.ready) {
-      if (message) console.log(`[WhatsApp] Loading ${percent}% (QR still visible) — ${message}`);
-      return;
-    }
-    state.phase = "loading";
-    state.qr = null;
-    if (message) console.log(`[WhatsApp] Loading ${percent}% — ${message}`);
-    if (state.loadingPercent >= 90) {
-      startConnectedPoll(waClient);
-    }
-  });
-
-  waClient.on("authenticated", () => {
-    state.phase = "authenticating";
-    state.qr = null;
-    state.lastError = null;
-    state.authenticatingSince = Date.now();
-    state.loadingPercent = Math.max(state.loadingPercent, 95);
-    markSessionLinked();
-    console.log("[WhatsApp] Authenticated — waiting for CONNECTED state…");
-    scheduleAuthTimeout();
-    startConnectedPoll(waClient);
-  });
-
-  waClient.on("change_state", (waState) => {
-    state.waState = waState;
-    console.log("[WhatsApp] State:", waState);
-    if (waState === "CONNECTED") {
-      markReady("change_state");
-    }
-  });
-
-  waClient.on("ready", () => {
-    markReady("ready-event");
-  });
-
-  waClient.on("auth_failure", (msg) => {
-    clearTimeout(authTimer);
-    state.ready = false;
-    state.phase = "error";
-    state.lastError = `Authentication failed: ${msg}. Click Reset Connection and scan again.`;
-    console.error("[WhatsApp] Auth failure:", msg);
-  });
-
-  waClient.on("disconnected", (reason) => {
-    clearTimeout(authTimer);
-    state.ready = false;
-    const reasonText = String(reason || "unknown");
-    console.warn("[WhatsApp] Disconnected:", reasonText);
-
-    if (reasonText === "LOGOUT" || reasonText === "UNPAIRED") {
-      clearSessionLinked();
-      state.phase = "error";
-      state.lastError = "Logged out from phone. Click Reset Connection and scan QR again.";
-      return;
-    }
-
-    state.phase = "disconnected";
-    state.lastError = `Reconnecting (${reasonText})…`;
-    scheduleReconnect(15000);
-  });
-
-  waClient.on("error", (err) => {
-    console.error("[WhatsApp] Client error:", err?.message || err);
-    if (!state.ready) return;
-    if (isSessionError(err)) {
-      state.ready = false;
-      state.phase = "disconnected";
-      state.lastError = "WhatsApp reconnecting…";
-      scheduleReconnect(20000);
-    }
-  });
-}
-
-function scheduleReconnect(delayMs) {
-  const now = Date.now();
-  if (now - lastReconnectAt < 20000) {
-    delayMs = Math.max(delayMs, 20000);
-  }
-  lastReconnectAt = now;
-  clearTimeout(scheduleReconnect._timer);
-  scheduleReconnect._timer = setTimeout(() => {
-    softRecoverClient("disconnect").catch((err) => {
-      state.phase = "error";
-      state.lastError = err.message || "Could not reconnect WhatsApp.";
-      console.error("[WhatsApp] Reconnect failed:", err.message);
-    });
-  }, delayMs);
-}
-
-async function destroyClient() {
-  clearTimeout(authTimer);
-  clearConnectPoll();
-  clearRestoreWatchdog();
-  clearQrStartupWatchdog();
-  if (client) {
-    const browserProc = client.pupBrowser?.process?.();
-    try {
-      await Promise.race([client.destroy(), sleep(4000)]);
-    } catch (err) {
-      console.warn("[WhatsApp] Destroy:", err.message);
-    }
-    try {
-      if (browserProc && !browserProc.killed) {
-        browserProc.kill("SIGKILL");
-      }
-    } catch {
-      /* ignore */
-    }
-    client = null;
-  }
-  pagePatchesApplied = false;
-  for (const lockName of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
-    try {
-      fs.rmSync(path.join(sessionDirPath(), lockName), { force: true });
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function wipeAuthDir() {
-  try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-  } catch (err) {
-    console.warn("[WhatsApp] wipeAuthDir rmSync failed:", err.message);
-    try {
-      const sDir = sessionDirPath();
-      if (fs.existsSync(sDir)) {
-        fs.renameSync(sDir, `${sDir}-stale-${Date.now()}`);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
+function ensureAuthDir() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
-  clearSessionLinked();
+  fs.mkdirSync(BAILEYS_AUTH_DIR, { recursive: true });
 }
 
-async function initializeClient({ fresh = false, _retried = false } = {}) {
-  if (initInProgress) return;
-  initInProgress = true;
-  bridgeStartedAt = Date.now();
-  qrDuringRestoreCount = 0;
-  state.phase = "starting";
-  state.lastError = "Loading WhatsApp libraries…";
-  // Yield so /health and /status respond before heavy synchronous requires block the event loop.
-  await sleep(250);
+function hasSessionLinked() {
   try {
-    ensureWwebjs();
+    const credsPath = path.join(BAILEYS_AUTH_DIR, "creds.json");
+    if (!fs.existsSync(credsPath)) return false;
+    const raw = fs.readFileSync(credsPath, "utf8");
+    const creds = JSON.parse(raw);
+    return Boolean(creds?.me?.id || creds?.registered);
+  } catch {
+    return false;
+  }
+}
+
+function wipeBaileysAuth() {
+  try {
+    fs.rmSync(BAILEYS_AUTH_DIR, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 150,
+    });
   } catch (err) {
-    state.phase = "error";
-    state.lastError = `Scanner libraries failed to load: ${err.message}`;
-    initInProgress = false;
-    throw err;
+    console.warn("[WhatsApp] wipeBaileysAuth:", err.message);
   }
-  await sleep(0);
-  if (!fresh && !_retried) {
-    clearWaWebHtmlCacheOnly();
-  } else {
-    ensureWaWebCache();
-  }
-  resetChromePathCache();
-  await sleep(0);
-  if (!validateHostedChrome()) {
-    initInProgress = false;
-    return;
-  }
-
-  if (fresh) {
-    wipeAuthDir();
-  } else if (IS_HOSTED && hasSessionLinked()) {
-    const sessionDir = sessionDirPath();
-    let sessionUsable = fs.existsSync(sessionDir);
-    if (sessionUsable) {
-      try {
-        const entries = fs.readdirSync(sessionDir).filter((name) => !name.startsWith("."));
-        sessionUsable = entries.length > 0;
-      } catch {
-        sessionUsable = false;
-      }
-    }
-    if (!sessionUsable) {
-      console.warn("[WhatsApp] Saved session missing or empty — clearing for fresh QR.");
-      wipeAuthDir();
-    }
-  }
-
-  await destroyClient();
-  client = createClient();
-  bindClientEvents(client);
-  const linked = hasSessionLinked() || fs.existsSync(sessionDirPath());
-  state.phase = linked ? "restoring" : "starting";
-  state.lastError = linked
-    ? "Restoring saved WhatsApp session — no scan needed if already linked on your phone."
-    : IS_HOSTED
-      ? "Loading WhatsApp scanner — scan QR once to link."
-      : null;
-  state.ready = false;
-  state.authenticatingSince = null;
-  state.waState = null;
-  state.sessionLinked = linked;
-  state.qr = null;
-  state.qrGeneration = 0;
-  if (linked) {
-    console.log("[WhatsApp] Restoring saved WhatsApp session from disk…");
-    scheduleRestoreWatchdog();
-  }
-  scheduleQrStartupWatchdog();
-  const initTimeoutMs = skipVersionCache ? Math.max(INIT_TIMEOUT_MS, 120000) : INIT_TIMEOUT_MS;
-  try {
-    await Promise.race([
-      client.initialize(),
-      sleep(initTimeoutMs).then(() => {
-        throw new Error("INIT_TIMEOUT");
-      }),
-    ]);
-  } catch (err) {
-    const errText = String(err?.message || err || "");
-    const timedOut = errText === "INIT_TIMEOUT" || /timeout/i.test(errText);
-    const injectFailed = /inject|ExecutionContext|evaluate|Socket/i.test(`${errText}${err?.stack || ""}`);
-    if (IS_HOSTED && !_retried && (timedOut || injectFailed || errText)) {
-      if (/Socket/i.test(errText) || timedOut) {
-        skipVersionCache = true;
-        console.warn("[WhatsApp] Init failed — retrying with live WA Web (no version cache)…", errText);
-      } else {
-        console.warn("[WhatsApp] Scanner init failed — retrying with remote WA Web cache (session kept)…", errText);
-        process.env.WHATSAPP_REMOTE_CACHE = "1";
-      }
-      await destroyClient();
-      initInProgress = false;
-      return initializeClient({ fresh, _retried: true });
-    }
-    state.phase = "error";
-    state.lastError = `Scanner failed to start: ${errText}. Click Reset Connection and wait for a fresh QR.`;
-    console.error("[WhatsApp] initialize() failed:", errText);
-    throw err;
-  } finally {
-    initInProgress = false;
-  }
+  fs.mkdirSync(BAILEYS_AUTH_DIR, { recursive: true });
+  state.sessionLinked = false;
 }
 
-function waitForReady(timeoutMs) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const check = () => {
-      if (state.ready && client) return resolve(true);
-      if (state.phase === "qr" && state.qr) return resolve(false);
-      if (Date.now() - started >= timeoutMs) return resolve(false);
-      setTimeout(check, 400);
-    };
-    check();
-  });
-}
-
-async function softRecoverClient(reason) {
-  if (recovering) {
-    while (recovering) {
-      await sleep(300);
-    }
-    return state.ready;
-  }
-
-  recovering = true;
-  const linked = hasSessionLinked();
-  state.lastError = linked
-    ? "Reconnecting saved WhatsApp session…"
-    : "Reconnecting WhatsApp session…";
-  console.warn("[WhatsApp] Recovering session:", reason);
-
+function acquireSingleInstanceLock() {
+  ensureAuthDir();
   try {
-    if (client) {
-      try {
-        const waState = await client.getState();
-        if (waState === "CONNECTED") {
-          markReady("recover-check");
-          return true;
+    if (fs.existsSync(LOCK_FILE)) {
+      const oldPid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+      if (oldPid && oldPid !== process.pid) {
+        try {
+          process.kill(oldPid, 0);
+        } catch {
+          fs.rmSync(LOCK_FILE, { force: true });
         }
-      } catch {
-        /* fall through */
       }
     }
-
-    state.ready = false;
-    state.phase = linked ? "restoring" : "reconnecting";
-    await destroyClient();
-    await initializeClient();
-    const ok = await waitForReady(90000);
-    if (!ok && state.phase === "qr") {
-      state.lastError = linked
-        ? "Saved session expired — scan the QR code once to link again."
-        : "Scan the QR code in the billing app to connect WhatsApp.";
-    } else if (!ok) {
-      state.lastError = linked
-        ? "WhatsApp reconnect timed out. Keep the scanner running and try sending again."
-        : "WhatsApp reconnect timed out. Click Reset Connection if needed.";
-    }
-    return ok;
-  } finally {
-    recovering = false;
+    fs.writeFileSync(LOCK_FILE, String(process.pid), "utf8");
+  } catch {
+    /* best-effort lock */
   }
 }
 
-async function resetSession() {
-  clearTimeout(scheduleReconnect._timer);
-  clearRestoreWatchdog();
-  releaseSendLock();
-  recovering = false;
-  qrDuringRestoreCount = 0;
-  skipVersionCache = false;
-  if (IS_HOSTED) process.env.WHATSAPP_REMOTE_CACHE = "0";
-  state.ready = false;
-  state.qr = null;
-  state.qrGeneration = 0;
-  state.lastError = null;
-  state.phase = "starting";
-  state.loadingPercent = 0;
-
-  await destroyClient();
-  await initializeClient({ fresh: true });
+function releaseSingleInstanceLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+      if (pid === process.pid) fs.rmSync(LOCK_FILE, { force: true });
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 function normalizePhone(phone) {
@@ -1128,762 +119,233 @@ function normalizePhone(phone) {
   return digits;
 }
 
-function isPhoneChatId(chatId) {
-  if (!chatId || typeof chatId !== "string") return false;
-  if (chatId.includes("@lid")) return false;
-  return chatId.endsWith("@c.us") || chatId.endsWith("@s.whatsapp.net");
-}
-
-/** Always use phone-based chat IDs — never @lid (causes getter crashes on newer WA Web). */
-function phoneChatTargets(digits) {
-  return [`${digits}@c.us`, `${digits}@s.whatsapp.net`];
-}
-
-let pagePatchesApplied = false;
-/** "pn" forces phone-number addressing; "native" lets WhatsApp Web use its own LID addressing. */
-let lidAddressingMode = process.env.WA_LID_MODE === "pn" ? "pn" : "native";
-
-async function applyWhatsAppPagePatches(force = false) {
-  if (!client?.pupPage) return;
-  if (pagePatchesApplied && !force) return;
-  try {
-    await client.pupPage.evaluate((forcePn) => {
-      try {
-        const gating = window.require("WAWebLid1X1MigrationGating");
-        const utils = gating?.Lid1X1MigrationUtils;
-        if (utils && !utils.__rinseOriginalIsLidMigrated) {
-          utils.__rinseOriginalIsLidMigrated = utils.isLidMigrated;
-        }
-        if (gating && typeof gating.shouldHaveAccountLid === "function" && !gating.__rinseOriginalShouldHaveAccountLid) {
-          gating.__rinseOriginalShouldHaveAccountLid = gating.shouldHaveAccountLid;
-        }
-        if (utils?.__rinseOriginalIsLidMigrated) {
-          utils.isLidMigrated = forcePn ? () => false : utils.__rinseOriginalIsLidMigrated;
-        }
-        if (gating?.__rinseOriginalShouldHaveAccountLid) {
-          gating.shouldHaveAccountLid = forcePn ? () => false : gating.__rinseOriginalShouldHaveAccountLid;
-        }
-      } catch {
-        /* this WhatsApp Web build uses a different module layout */
-      }
-      try {
-        const utils = window.require("WAWebLidMigrationUtils");
-        if (typeof utils?.toUserLid === "function" && !utils.toUserLid.__rinsePatched) {
-          const original = utils.toUserLid.bind(utils);
-          const wrapped = (wid) => {
-            try {
-              return original(wid);
-            } catch {
-              return wid;
-            }
-          };
-          wrapped.__rinsePatched = true;
-          utils.toUserLid = wrapped;
-        }
-      } catch {
-        /* optional on this WhatsApp Web build */
-      }
-
-      if (window.WWebJS?.processMediaData && !window.WWebJS.processMediaData.__rinseNoXid) {
-        const originalProcess = window.WWebJS.processMediaData.bind(window.WWebJS);
-        const wrappedProcess = async (...args) => {
-          const media = await originalProcess(...args);
-          if (!media || typeof media !== "object") return media;
-          const plain = { ...media };
-          delete plain.__x_id;
-          if (typeof media.toJSON === "function") {
-            plain.toJSON = () => {
-              const json = { ...media.toJSON() };
-              delete json.__x_id;
-              return json;
-            };
-          }
-          return plain;
-        };
-        wrappedProcess.__rinseNoXid = true;
-        window.WWebJS.processMediaData = wrappedProcess;
-      }
-    }, lidAddressingMode === "pn");
-    if (!pagePatchesApplied) console.log("[WhatsApp] Applied in-page send patches.");
-    pagePatchesApplied = true;
-  } catch (err) {
-    console.warn("[WhatsApp] Page patches failed:", err.message);
+function clearSendLockIfStale() {
+  if (sendInProgress && sendInProgressSince && Date.now() - sendInProgressSince > 60000) {
+    sendInProgress = false;
+    sendInProgressSince = 0;
   }
 }
 
-function serializeWid(wid) {
-  if (!wid) return null;
-  if (typeof wid === "string") return wid;
-  if (wid._serialized) return wid._serialized;
-  if (wid.$1) return wid.$1;
-  if (wid.user && wid.server) return `${wid.user}@${wid.server}`;
-  return null;
-}
-
-async function ensureChatRegistered(chatId) {
-  if (!client?.pupPage || !isPhoneChatId(chatId)) return false;
-  try {
-    return await client.pupPage.evaluate(async (targetChatId) => {
-      try {
-        const chat = await window.WWebJS.getChat(targetChatId, { getAsModel: false });
-        if (chat?.id) return true;
-      } catch {
-        /* fall through */
-      }
-      try {
-        const chatWid = window.require("WAWebWidFactory").createWid(targetChatId);
-        const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
-        return Boolean(found?.chat?.id);
-      } catch {
-        return false;
-      }
-    }, chatId);
-  } catch (err) {
-    console.warn("[WhatsApp] ensureChatRegistered:", err.message);
-    return false;
-  }
-}
-
-/** Phone-only chat IDs — never @lid from getNumberId (breaks PDF send on hosted WA Web). */
-async function resolveSendTargets(digits) {
-  return phoneChatTargets(digits);
-}
-
-const SEND_OPTIONS = { sendSeen: false, sendMediaAsDocument: true };
-const SEND_IMAGE_OPTIONS = { sendSeen: false, sendMediaAsDocument: false };
-
-async function quickSendCheck() {
-  if (!client || !state.ready) {
-    throw new Error("WhatsApp not connected.");
-  }
-  const waState = await client.getState();
-  if (waState !== "CONNECTED") {
-    state.ready = false;
-    throw new Error(`WhatsApp not fully connected (${waState || "unknown"}).`);
-  }
-}
-
-async function assertSendReady({ maxCommsWaitMs = 3000 } = {}) {
-  await quickSendCheck();
-  if (await isWhatsAppStoreReady()) {
-    if (await isCommsReady()) return;
-  }
-  state.ready = false;
-  state.phase = "loading";
-  state.lastError = "WhatsApp is still connecting. Wait a few seconds and try again.";
-  const commsOk = maxCommsWaitMs > 0 ? await waitForCommsReady(maxCommsWaitMs) : false;
-  if (!commsOk) {
-    const err = new Error("WhatsApp is still starting its send layer. Wait a few seconds, then try again.");
-    err.code = "COMMS_NOT_READY";
-    throw err;
-  }
-  state.ready = true;
-  state.phase = "ready";
-}
-
-async function lookupRegisteredChatId(digits) {
-  try {
-    const registered = await Promise.race([
-      client.getNumberId(digits),
-      sleep(GET_NUMBER_ID_TIMEOUT_MS).then(() => null),
-    ]);
-    return serializeWid(registered);
-  } catch (err) {
-    console.warn("[WhatsApp] getNumberId failed:", err.message);
-    return null;
-  }
-}
-
-async function sendMediaToChat(chatId, media, caption) {
-  await client.sendMessage(chatId, media, {
-    ...SEND_OPTIONS,
-    caption: caption || "",
-  });
-}
-
-async function waitForMessageAck(msgId, timeoutMs = 25000) {
-  if (!client?.pupPage || !msgId) return false;
-  const deadline = Date.now() + timeoutMs;
-  let lastAck = null;
-  let missing = 0;
-  while (Date.now() < deadline) {
-    const ack = await client.pupPage.evaluate((id) => {
-      const msgs = window.require("WAWebCollections").Msg;
-      let msg = null;
-      try {
-        msg = msgs.get(id);
-      } catch {
-        msg = null;
-      }
-      if (!msg && typeof msgs.getModelsArray === "function") {
-        msg = msgs
-          .getModelsArray()
-          .find((m) => (m?.id?._serialized || m?.id?.$1 || String(m?.id || "")) === id);
-      }
-      return typeof msg?.ack === "number" ? msg.ack : -99;
-    }, msgId);
-    lastAck = ack;
-    if (ack >= 1) return true;
-    if (ack === -99) missing += 1;
-    if (missing > 5) break;
-    await sleep(200);
-  }
-  console.warn(`[WhatsApp] No delivery ack for ${msgId} (last ack ${lastAck}).`);
-  return false;
-}
-
-async function verifyRecentDocumentInChat(chatId, filename, msgId, sentAfterSec, timeoutMs = 20000) {
-  if (!client?.pupPage) return false;
-  const needle = String(filename || "").toLowerCase();
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const found = await client.pupPage.evaluate(
-      (targetChatId, targetFilename, expectedMsgId, minTimestamp) => {
-        const chat = window.require("WAWebCollections").Chat.get(
-          window.require("WAWebWidFactory").createWid(targetChatId)
-        );
-        if (!chat?.msgs?.getModelsArray) return false;
-        const recent = chat.msgs.getModelsArray().slice(-8).reverse();
-        const nowSec = Math.floor(Date.now() / 1000);
-        for (const msg of recent) {
-          if (!msg?.fromMe) continue;
-          if (expectedMsgId && (msg.id?._serialized || msg.id?.$1) !== expectedMsgId) continue;
-          const type = msg.type || msg.kind;
-          if (type !== "document") continue;
-          const msgTime = Number(msg.t || 0);
-          if (minTimestamp && msgTime < minTimestamp) continue;
-          if (nowSec - msgTime > 120) continue;
-          const name = String(msg.filename || msg._data?.filename || "").toLowerCase();
-          const ack = typeof msg.ack === "number" ? msg.ack : 0;
-          if (
-            ack >= 1 &&
-            (!targetFilename || name.includes(String(targetFilename).replace(".pdf", "")))
-          ) {
-            return true;
-          }
-        }
-        return false;
-      },
-      chatId,
-      needle,
-      msgId || "",
-      sentAfterSec || 0
-    );
-    if (found) return true;
-    await sleep(1000);
-  }
-  return false;
-}
-
-async function confirmPdfDelivered(chatId, filename, msgId, sentAfterSec) {
-  if (msgId && (await waitForMessageAck(msgId, 30000))) {
-    return true;
-  }
-  if (await verifyRecentDocumentInChat(chatId, filename, msgId, sentAfterSec, 25000)) {
-    return true;
-  }
-  const err = new Error(
-    "WhatsApp did not confirm the invoice PDF was delivered. Please try Send again."
-  );
-  err.code = "SEND_NOT_CONFIRMED";
-  throw err;
-}
-
-/** Resolve chat + send PDF via addAndSendMsgToChat — skips WWebJS.sendMessage/link-preview getters. */
-async function sendDocumentRobust(chatId, filePath, filename, caption) {
-  if (!client?.pupPage) throw new Error("WhatsApp not connected.");
-  const media = MessageMedia.fromFilePath(filePath);
-  media.filename = filename || path.basename(filePath);
-  const mediaPayload = {
-    data: media.data,
-    mimetype: media.mimetype,
-    filename: media.filename,
+function withSendLock(fn) {
+  const run = async () => {
+    sendInProgress = true;
+    sendInProgressSince = Date.now();
+    try {
+      return await fn();
+    } finally {
+      sendInProgress = false;
+      sendInProgressSince = 0;
+    }
   };
-
-  const result = await client.pupPage.evaluate(
-    async (targetChatId, payload, captionText) => {
-      const fail = (error, code) => ({
-        ok: false,
-        error: String(error || "send failed"),
-        code: code || null,
-      });
-
-      const widText = (wid) => {
-        if (!wid) return null;
-        if (typeof wid === "string") return wid;
-        if (wid._serialized) return wid._serialized;
-        if (wid.$1) return wid.$1;
-        if (wid.user && wid.server) return `${wid.user}@${wid.server}`;
-        return null;
-      };
-
-      const tryOpenChat = async (targetId) => {
-        if (!targetId) return null;
-
-        try {
-          const chat = await window.WWebJS.getChat(targetId, { getAsModel: false });
-          if (chat?.id) return chat;
-        } catch {
-          /* try create/find */
-        }
-
-        let chatWid = null;
-        try {
-          chatWid = window.require("WAWebWidFactory").createWid(targetId);
-        } catch {
-          return null;
-        }
-        try {
-          const found = await window.require("WAWebFindChatAction").findOrCreateLatestChat(chatWid);
-          if (found?.chat?.id) return found.chat;
-        } catch {
-          /* number has no linked id yet */
-        }
-
-        try {
-          const chat = await window.require("WAWebCollections").Chat.find(chatWid);
-          if (chat?.id) return chat;
-        } catch {
-          /* no chat */
-        }
-
-        return null;
-      };
-
-      const syncUnsavedNumber = async (targetId) => {
-        try {
-          const raw = String(targetId || "");
-          if (!raw || raw.includes("@lid") || raw.includes("newsletter") || raw.includes("broadcast")) return null;
-          const phoneNumber = raw.split("@")[0];
-          if (!phoneNumber) return null;
-          const sync = window.require("WAWebContactSyncUtils");
-          if (typeof sync?.constructUsyncDeltaQuery !== "function") return null;
-          const query = sync.constructUsyncDeltaQuery([{ type: "add", phoneNumber }]);
-          const result = await query.execute();
-          const entry = result?.list?.[0];
-          const lid = entry?.lid?._serialized || entry?.lid?.$1 || entry?.lid;
-          if (!lid) return null;
-          return typeof lid === "string" ? lid : widText(lid);
-        } catch {
-          return null;
-        }
-      };
-
-      const resolveChat = async (targetId) => {
-        if (!targetId) return null;
-        const phoneChat = await tryOpenChat(targetId);
-        if (phoneChat?.id) return phoneChat;
-        if (!String(targetId).includes("@lid")) {
-          const lid = await syncUnsavedNumber(targetId);
-          if (lid) return tryOpenChat(lid);
-        }
-        return null;
-      };
-
-      const senderForChat = (chat) => {
-        const prefs = window.require("WAWebUserPrefsMeUser");
-        const lidUser = typeof prefs.getMaybeMeLidUser === "function" ? prefs.getMaybeMeLidUser() : null;
-        const meUser = typeof prefs.getMaybeMePnUser === "function" ? prefs.getMaybeMePnUser() : null;
-        const serialized = widText(chat?.id) || "";
-        const chatIsLid =
-          (typeof chat?.id?.isLid === "function" && chat.id.isLid()) || serialized.includes("@lid");
-        return chatIsLid ? lidUser || meUser : meUser || lidUser;
-      };
-
-      const destinationIds = async () => {
-        const ids = [];
-        const push = (wid) => {
-          const text = widText(wid);
-          if (text && !ids.includes(text)) ids.push(text);
-        };
-        push(targetChatId);
-        if (String(targetChatId).endsWith("@c.us")) {
-          push(String(targetChatId).replace("@c.us", "@s.whatsapp.net"));
-        }
-        try {
-          if (window.WWebJS?.enforceLidAndPnRetrieval) {
-            const pair = await window.WWebJS.enforceLidAndPnRetrieval(targetChatId);
-            push(pair?.lid);
-            push(pair?.phone);
-          }
-        } catch {
-          /* unsaved numbers can still be messaged by phone id */
-        }
-        try {
-          const phoneWid = window.require("WAWebWidFactory").createWid(targetChatId);
-          const jobs = window.require("WAWebQueryExistsJob");
-          const method = ["queryWidExists", "queryPhoneExists", "queryExists"].find(
-            (name) => typeof jobs?.[name] === "function"
-          );
-          if (method) {
-            const exists = await jobs[method](phoneWid);
-            push(exists?.wid);
-            push(exists?.lid);
-            push(exists?.phone);
-          }
-        } catch {
-          /* lookup is optional; the phone number is still the send target */
-        }
-        return ids;
-      };
-
-      try {
-        const ids = await destinationIds();
-        let chat = null;
-        for (const targetId of ids) {
-          chat = await resolveChat(targetId);
-          if (chat?.id) break;
-        }
-        if (!chat?.id) {
-          return fail("Could not open WhatsApp chat for this number.", "NO_CHAT");
-        }
-
-        const mediaOptions = await window.WWebJS.processMediaData(payload, {
-          forceDocument: true,
-        });
-        mediaOptions.caption = captionText || "";
-
-        const from = senderForChat(chat);
-        if (!from) {
-          return fail("WhatsApp sender is not ready yet — wait a few seconds and retry.", "NOT_READY");
-        }
-
-        const newId = await window.require("WAWebMsgKey").newId();
-        const newMsgKey = new (window.require("WAWebMsgKey"))({
-          from,
-          to: chat.id,
-          id: newId,
-          selfDir: "out",
-        });
-
-        let ephemeralFields = {};
-        try {
-          ephemeralFields =
-            window.require("WAWebGetEphemeralFieldsMsgActionsUtils").getEphemeralFields(chat) || {};
-        } catch {
-          ephemeralFields = {};
-        }
-
-        const message = {
-          ack: 0,
-          body: mediaOptions.preview || "",
-          local: true,
-          self: "out",
-          t: parseInt(String(Date.now() / 1000), 10),
-          isNewMsg: true,
-          type: "document",
-          ...ephemeralFields,
-          ...mediaOptions,
-          ...(typeof mediaOptions.toJSON === "function" ? mediaOptions.toJSON() : {}),
-        };
-        // MediaData's private __x_id collides with Msg's id during Msg init.
-        delete message.__x_id;
-        message.id = newMsgKey;
-        message.from = from;
-        message.to = chat.id;
-        message.type = "document";
-
-        const [msgPromise, sendMsgResultPromise] = window
-          .require("WAWebSendMsgChatAction")
-          .addAndSendMsgToChat(chat, message);
-        await msgPromise;
-        const sendResult = await sendMsgResultPromise;
-        const msgId = widText(newMsgKey) || (typeof newMsgKey.toString === "function" ? newMsgKey.toString() : null);
-        const ack = window.require("WAWebCollections").Msg.get(msgId)?.ack ?? 0;
-        let sendStatus = "";
-        try {
-          sendStatus = String(sendResult?.messageSendResult ?? JSON.stringify(sendResult) ?? "");
-        } catch {
-          sendStatus = String(sendResult);
-        }
-        return { ok: true, msgId, ack, sendStatus, chatId: widText(chat.id) };
-      } catch (err) {
-        const failure = fail(err?.message || err);
-        failure.stack = String(err?.stack || "").split("\n").slice(0, 6).join(" | ");
-        return failure;
-      }
-    },
-    chatId,
-    mediaPayload,
-    caption || ""
-  );
-
-  if (result?.ok && result.msgId) {
-    console.log(
-      `[WhatsApp] PDF queued in ${result.chatId} (mode ${lidAddressingMode}, ack ${result.ack}, result ${result.sendStatus || "-"})`
-    );
-    if (await waitForMessageAck(result.msgId, 20000)) return result.chatId || chatId;
-    const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
-    err.code = "SEND_NOT_CONFIRMED";
-    throw err;
-  }
-  if (result?.stack) console.warn("[WhatsApp] Direct PDF send stack:", result.stack);
-  const err = new Error(result?.error || "Failed to send on WhatsApp.");
-  if (result?.code === "NOT_READY") {
-    err.code = "COMMS_NOT_READY";
-  }
-  if (result?.code === "NO_CHAT" && /not registered/i.test(String(result?.error || ""))) {
-    err.code = "NOT_ON_WHATSAPP";
-  }
-  if (isContactGetterError(err) || isLidError(err)) {
-    err.code = "CONTACT_GETTER";
-  }
-  throw err;
+  const next = sendQueue.then(run, run);
+  sendQueue = next.catch(() => {});
+  return next;
 }
 
-/** Plain text via addAndSendMsgToChat into an already-open chat (no link-preview/contact getters). */
-async function sendTextToOpenChat(chatId, text, { waitForAck = true } = {}) {
-  if (!client?.pupPage || !chatId || !text) return false;
-  const result = await client.pupPage.evaluate(
-    async (targetChatId, body) => {
-      try {
-        const wid = window.require("WAWebWidFactory").createWid(targetChatId);
-        const chat = window.require("WAWebCollections").Chat.get(wid);
-        if (!chat?.id) return { ok: false, error: "chat not open" };
-        const prefs = window.require("WAWebUserPrefsMeUser");
-        const isLid = String(targetChatId).includes("@lid");
-        const lidUser = typeof prefs.getMaybeMeLidUser === "function" ? prefs.getMaybeMeLidUser() : null;
-        const pnUser = typeof prefs.getMaybeMePnUser === "function" ? prefs.getMaybeMePnUser() : null;
-        const from = isLid ? lidUser || pnUser : pnUser || lidUser;
-        const MsgKey = window.require("WAWebMsgKey");
-        const newMsgKey = new MsgKey({ from, to: chat.id, id: await MsgKey.newId(), selfDir: "out" });
-        let ephemeralFields = {};
-        try {
-          ephemeralFields =
-            window.require("WAWebGetEphemeralFieldsMsgActionsUtils").getEphemeralFields(chat) || {};
-        } catch {
-          ephemeralFields = {};
-        }
-        const message = {
-          ...ephemeralFields,
-          id: newMsgKey,
-          ack: 0,
-          body,
-          from,
-          to: chat.id,
-          local: true,
-          self: "out",
-          t: parseInt(String(Date.now() / 1000), 10),
-          isNewMsg: true,
-          type: "chat",
-        };
-        const [msgPromise, sendResultPromise] = window
-          .require("WAWebSendMsgChatAction")
-          .addAndSendMsgToChat(chat, message);
-        await msgPromise;
-        await sendResultPromise;
-        const msgId = newMsgKey._serialized || newMsgKey.$1 || newMsgKey.toString();
-        return { ok: true, msgId };
-      } catch (err) {
-        return { ok: false, error: String(err?.message || err) };
-      }
-    },
-    chatId,
-    text
-  );
-  if (!result?.ok) {
-    console.warn("[WhatsApp] Bill text send failed:", result?.error);
-    return false;
-  }
-  return waitForAck ? waitForMessageAck(result.msgId, 15000) : true;
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    sleep(ms).then(() => {
+      const err = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      err.code = "TIMEOUT";
+      throw err;
+    }),
+  ]);
 }
 
-async function sendBillPdfMessage(chatId, media, caption, filePath, filename) {
-  let directError = null;
+async function getBaileys() {
+  if (!baileysMod) {
+    baileysMod = await import("@whiskeysockets/baileys");
+  }
+  return baileysMod;
+}
+
+function closeCurrentSocket() {
+  if (!sock) return;
   try {
-    return await sendDocumentRobust(chatId, filePath, filename, caption || "");
-  } catch (err) {
-    directError = err;
-    console.warn("[WhatsApp] Direct PDF send failed, trying library send:", err.message);
-    if (err?.code === "NOT_ON_WHATSAPP" || err?.code === "SEND_NOT_CONFIRMED") throw err;
+    sock.ev.removeAllListeners();
+    sock.end(undefined);
+  } catch {
+    /* ignore */
   }
-
-  const msg = await client.sendMessage(chatId, media, {
-    caption: caption || "",
-    sendSeen: false,
-    sendMediaAsDocument: true,
-    linkPreview: false,
-    waitUntilMsgSent: true,
-  });
-  const msgId = msg?.id?._serialized || msg?.id?.$1 || null;
-  if (!msgId) {
-    throw directError || new Error("WhatsApp did not accept the PDF message.");
-  }
-  if (!(await waitForMessageAck(msgId, 20000))) {
-    const err = new Error("WhatsApp did not confirm the invoice PDF was delivered. Please try Send again.");
-    err.code = "SEND_NOT_CONFIRMED";
-    throw err;
-  }
-  return serializeWid(msg?.id?.remote) || chatId;
+  sock = null;
 }
 
-async function sendBillText(resolvedChatId, fallbackChatId, text, { waitForAck = true } = {}) {
-  if (!text) return;
-  if (await sendTextToOpenChat(resolvedChatId, text, { waitForAck })) {
-    console.log(`[WhatsApp] Bill message sent to ${resolvedChatId}`);
-    return;
-  }
+function scheduleReconnect(delayMs = 2000) {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    void initializeClient({ fresh: false }).catch((err) => {
+      console.error("[WhatsApp] Reconnect failed:", err.message);
+    });
+  }, delayMs);
+}
+
+async function initializeClient({ fresh = false } = {}) {
+  if (initInProgress) return;
+  initInProgress = true;
+  clearTimeout(reconnectTimer);
+  const myGen = ++socketGeneration;
+
   try {
-    await client.sendMessage(fallbackChatId, text, { linkPreview: false, sendSeen: false });
-    console.log(`[WhatsApp] Bill message sent via library to ${fallbackChatId}`);
+    ensureAuthDir();
+    closeCurrentSocket();
+
+    if (fresh) {
+      wipeBaileysAuth();
+    }
+
+    const linked = hasSessionLinked();
+    state.ready = false;
+    state.qr = null;
+    if (fresh) state.qrGeneration = 0;
+    state.sessionLinked = linked;
+    state.phase = linked ? "restoring" : "starting";
+    state.lastError = linked
+      ? "Restoring saved WhatsApp session — no scan needed if already linked."
+      : "Starting WhatsApp connection — QR code will appear in a few seconds.";
+    state.waState = null;
+
+    const {
+      default: makeWASocket,
+      useMultiFileAuthState,
+      DisconnectReason,
+      fetchLatestBaileysVersion,
+      Browsers,
+    } = await getBaileys();
+
+    const { state: authState, saveCreds } = await useMultiFileAuthState(BAILEYS_AUTH_DIR);
+
+    let version;
+    try {
+      const latest = await withTimeout(fetchLatestBaileysVersion(), 5000, "WA version lookup");
+      version = latest?.version;
+    } catch {
+      version = undefined;
+    }
+
+    if (myGen !== socketGeneration) return;
+
+    const waSock = makeWASocket({
+      auth: authState,
+      version,
+      logger: pino({ level: "silent" }),
+      browser: Browsers.ubuntu("Chrome"),
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 30000,
+    });
+
+    sock = waSock;
+
+    waSock.ev.on("creds.update", saveCreds);
+
+    waSock.ev.on("connection.update", async (update) => {
+      if (myGen !== socketGeneration) return;
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        try {
+          state.qr = await QRCode.toDataURL(qr, {
+            margin: 2,
+            width: 360,
+            errorCorrectionLevel: "H",
+          });
+          state.qrGeneration += 1;
+          state.phase = "qr";
+          state.ready = false;
+          state.sessionLinked = false;
+          state.lastError = null;
+          console.log(`[WhatsApp] QR ready (#${state.qrGeneration}) — scan in billing app.`);
+        } catch (err) {
+          state.lastError = "Could not render QR code.";
+          console.error("[WhatsApp] QR render error:", err.message);
+        }
+      }
+
+      if (connection === "connecting") {
+        if (state.phase !== "qr") {
+          state.phase = state.sessionLinked ? "restoring" : "connecting";
+        }
+      }
+
+      if (connection === "open") {
+        state.ready = true;
+        state.phase = "ready";
+        state.qr = null;
+        state.lastError = null;
+        state.sessionLinked = true;
+        state.authenticatingSince = null;
+        state.waState = "CONNECTED";
+        console.log("[WhatsApp] Connected and ready to send invoices (Baileys).");
+      }
+
+      if (connection === "close") {
+        state.ready = false;
+        state.waState = "DISCONNECTED";
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reasonMsg = lastDisconnect?.error?.message || "Connection closed";
+        console.warn(`[WhatsApp] Connection closed (${statusCode || "unknown"}): ${reasonMsg}`);
+
+        if (
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === DisconnectReason.badSession
+        ) {
+          console.warn("[WhatsApp] Session logged out or invalid — clearing for fresh QR.");
+          wipeBaileysAuth();
+          state.phase = "starting";
+          state.lastError = "WhatsApp session expired — generating a new QR code…";
+          scheduleReconnect(500);
+          return;
+        }
+
+        const delay = statusCode === DisconnectReason.restartRequired ? 400 : 2000;
+        state.phase = state.sessionLinked ? "restoring" : "starting";
+        state.lastError = "Reconnecting to WhatsApp…";
+        scheduleReconnect(delay);
+      }
+    });
   } catch (err) {
-    console.warn("[WhatsApp] Bill message (text) could not be sent:", err.message);
+    state.phase = "error";
+    state.lastError = `WhatsApp failed to start: ${err.message}`;
+    console.error("[WhatsApp] initializeClient error:", err);
+  } finally {
+    initInProgress = false;
   }
 }
 
-function captionForPdfSend(message) {
-  const text = String(message || "").trim();
-  return text || "Your invoice from Rinse & Rise Laundryrite is attached.";
+async function resetSession() {
+  clearTimeout(reconnectTimer);
+  state.ready = false;
+  state.qr = null;
+  state.qrGeneration = 0;
+  state.lastError = null;
+  state.phase = "starting";
+  state.loadingPercent = 0;
+  await initializeClient({ fresh: true });
 }
 
-async function performSend(digits, message, filePath, filename) {
-  ensureWwebjs();
-  await applyWhatsAppPagePatches();
-
-  const fullCaption = String(message || "");
-  const pdfCaption = captionForPdfSend(fullCaption);
-  const media = MessageMedia.fromFilePath(filePath);
-  media.filename = filename || path.basename(filePath);
-  const chatId = `${digits}@c.us`;
-
-  let lastErr = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
-      await ensureChatRegistered(chatId);
-      const sentChatId = await sendBillPdfMessage(chatId, media, "", filePath, filename);
-      console.log(`[WhatsApp] Bill PDF sent to ${chatId}`);
-      await sendBillText(sentChatId || chatId, chatId, pdfCaption, { waitForAck: false });
-      return;
-    } catch (err) {
-      lastErr = err;
-      console.warn(`[WhatsApp] Bill send attempt ${attempt}/2 (${chatId}):`, err.message);
-      if (err?.code === "NOT_ON_WHATSAPP") break;
-      if (err?.code === "SEND_NOT_CONFIRMED") {
-        if (attempt >= 2) break;
-        lidAddressingMode = lidAddressingMode === "pn" ? "native" : "pn";
-        console.warn(`[WhatsApp] Switching addressing mode to ${lidAddressingMode} and retrying.`);
-        await applyWhatsAppPagePatches(true);
-        continue;
-      }
-      if (isCommsError(err) && attempt < 2) {
-        await sleep(2500);
-        continue;
-      }
-      if ((isSessionError(err) || isStoreError(err)) && attempt < 2) {
-        await sleep(2000);
-        continue;
-      }
-    }
-  }
-
-  const fallbackChatId = `${digits}@s.whatsapp.net`;
-  if (lastErr?.code !== "NOT_ON_WHATSAPP" && lastErr?.code !== "SEND_NOT_CONFIRMED") {
-    try {
-      await ensureChatRegistered(fallbackChatId);
-      const sentChatId = await sendBillPdfMessage(fallbackChatId, media, "", filePath, filename);
-      console.log(`[WhatsApp] Bill PDF sent to ${fallbackChatId}`);
-      await sendBillText(sentChatId || fallbackChatId, fallbackChatId, pdfCaption);
-      return;
-    } catch (err) {
-      lastErr = err;
-      console.warn(`[WhatsApp] Fallback send (${fallbackChatId}):`, err.message);
-    }
-  }
-
-  if (lastErr?.code === "NOT_ON_WHATSAPP") {
-    const err = new Error(
-      `Could not deliver the invoice to ${digits.slice(-10)}. The number must be on WhatsApp, but it does not need to be saved in contacts.`
-    );
-    err.code = "NOT_ON_WHATSAPP";
-    throw err;
-  }
-
-  if (isContactGetterError(lastErr) || isLidError(lastErr)) {
-    const err = new Error(
-      "WhatsApp could not open this chat. Wait a few seconds and tap Send again."
-    );
-    err.code = "CONTACT_GETTER";
-    throw err;
-  }
-
-  throw lastErr || new Error("Failed to send on WhatsApp.");
-}
-
-async function performSendText(digits, message) {
-  ensureWwebjs();
-  await applyWhatsAppPagePatches();
-  await assertSendReady({ maxCommsWaitMs: 8000 });
-
-  const targets = await resolveSendTargets(digits);
-  const text = String(message || "").trim();
-  if (!text) throw new Error("Message is required.");
-
-  let lastErr = null;
-  for (const chatId of targets) {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
-        await ensureChatRegistered(chatId);
-        await client.sendMessage(chatId, text, { sendSeen: false });
-        return;
-      } catch (err) {
-        lastErr = err;
-        if (isLidError(err) || isContactGetterError(err)) {
-          console.warn(`[WhatsApp] Contact/LID error on ${chatId} — trying alternate chat id…`);
-          break;
-        }
-        if (isCommsError(err) && attempt < 3) {
-          console.warn(`[WhatsApp] Comms not ready (attempt ${attempt}/6) — retrying…`);
-          await sleep(4000 * attempt);
-          continue;
-        }
+async function resolveTargetJid(digits) {
+  if (!sock) throw new Error("WhatsApp not connected.");
+  try {
+    const results = await withTimeout(sock.onWhatsApp(digits), 5000, "onWhatsApp");
+    if (Array.isArray(results) && results.length > 0) {
+      const entry = results[0];
+      if (entry && entry.exists === false) {
+        const err = new Error(
+          `Could not deliver to ${digits.slice(-10)}. This number is not registered on WhatsApp.`
+        );
+        err.code = "NOT_ON_WHATSAPP";
         throw err;
       }
+      if (entry?.jid) return entry.jid;
     }
+  } catch (err) {
+    if (err.code === "NOT_ON_WHATSAPP") throw err;
+    console.warn("[WhatsApp] onWhatsApp check skipped:", err.message);
   }
-
-  throw lastErr || new Error("Failed to send on WhatsApp.");
-}
-
-async function performSendImage(digits, message, filePath, filename) {
-  ensureWwebjs();
-  await applyWhatsAppPagePatches();
-  await assertSendReady({ maxCommsWaitMs: 8000 });
-
-  const targets = await resolveSendTargets(digits);
-  const media = MessageMedia.fromFilePath(filePath);
-  media.filename = filename || path.basename(filePath);
-  const caption = String(message || "").trim();
-
-  let lastErr = null;
-  for (const chatId of targets) {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        if (attempt > 1) await assertSendReady({ maxCommsWaitMs: 2000 });
-        await ensureChatRegistered(chatId);
-        await client.sendMessage(chatId, media, {
-          ...SEND_IMAGE_OPTIONS,
-          caption,
-        });
-        return;
-      } catch (err) {
-        lastErr = err;
-        if (isLidError(err) || isContactGetterError(err)) {
-          console.warn(`[WhatsApp] Contact/LID error on ${chatId} — trying alternate chat id…`);
-          break;
-        }
-        if (isCommsError(err) && attempt < 3) {
-          console.warn(`[WhatsApp] Comms not ready (attempt ${attempt}/6) — retrying…`);
-          await sleep(4000 * attempt);
-          continue;
-        }
-        throw err;
-      }
-    }
-  }
-
-  throw lastErr || new Error("Failed to send image on WhatsApp.");
+  return `${digits}@s.whatsapp.net`;
 }
 
 app.get("/health", (_req, res) => {
@@ -1901,18 +363,12 @@ app.get("/health", (_req, res) => {
 
 app.get("/status", (_req, res) => {
   clearSendLockIfStale();
-  const authSeconds = state.authenticatingSince
-    ? Math.floor((Date.now() - state.authenticatingSince) / 1000)
-    : 0;
   const linked = state.sessionLinked || hasSessionLinked();
   const restoring =
-    !IS_HOSTED &&
     linked &&
     !state.ready &&
     !state.qr &&
-    ["starting", "restoring", "loading", "authenticating", "connecting", "reconnecting"].includes(
-      state.phase
-    );
+    ["starting", "restoring", "connecting"].includes(state.phase);
   const startupSeconds = Math.max(0, Math.floor((Date.now() - bridgeStartedAt) / 1000));
   res.json({
     ready: state.ready,
@@ -1920,9 +376,9 @@ app.get("/status", (_req, res) => {
     lastError: state.lastError,
     phase: state.phase,
     loadingPercent: state.loadingPercent,
-    recovering,
+    recovering: false,
     waState: state.waState,
-    authenticatingSeconds: authSeconds,
+    authenticatingSeconds: 0,
     startupSeconds,
     sessionLinked: linked,
     sessionRestoring: restoring,
@@ -1945,195 +401,152 @@ app.post("/reset", async (_req, res) => {
   }
 });
 
-app.post("/send-image", async (req, res) => {
-  const sendToken = await waitForSendLock();
-
-  if (!state.ready || !client) {
-    releaseSendLock(sendToken);
-    return res.status(503).json({
-      error: "WhatsApp not connected. Scan QR code in billing app.",
-      needsReconnect: true,
-    });
-  }
-
-  const { phone, message, imagePath, filename } = req.body || {};
-  const digits = normalizePhone(phone);
-  if (digits.length < 11) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Invalid phone number." });
-  }
-
-  const filePath = path.resolve(String(imagePath || ""));
-  if (!filePath || !fs.existsSync(filePath)) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Offer image file not found." });
-  }
-
+app.post("/send", async (req, res) => {
   try {
-    await withSendTimeout(performSendImage(digits, message, filePath, filename), "image send");
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[WhatsApp] Send-image failed:", err);
-    return res.status(500).json({
-      error: err.message || "Failed to send image on WhatsApp.",
-      needsReconnect: isSessionError(err),
+    const result = await withSendLock(async () => {
+      if (!state.ready || !sock) {
+        return {
+          status: 503,
+          body: {
+            error: "WhatsApp not connected. Scan QR code in billing app.",
+            needsReconnect: true,
+          },
+        };
+      }
+
+      const { phone, message, pdfPath, filename } = req.body || {};
+      const digits = normalizePhone(phone);
+      if (digits.length < 11) {
+        return { status: 400, body: { error: "Invalid phone number." } };
+      }
+
+      const filePath = path.resolve(String(pdfPath || ""));
+      if (!filePath || !fs.existsSync(filePath)) {
+        return { status: 400, body: { error: "Invoice PDF file not found." } };
+      }
+
+      const jid = await resolveTargetJid(digits);
+      const pdfBuffer = fs.readFileSync(filePath);
+      const docName = filename || path.basename(filePath);
+      const caption = String(message || "").trim() || "Your invoice from Rinse & Rise Laundryrite is attached.";
+
+      await withTimeout(
+        sock.sendMessage(jid, {
+          document: pdfBuffer,
+          mimetype: "application/pdf",
+          fileName: docName,
+          caption,
+        }),
+        SEND_TIMEOUT_MS,
+        "PDF send"
+      );
+
+      console.log(`[WhatsApp] Bill PDF sent to ${digits.slice(-10)} (${docName})`);
+      return { status: 200, body: { ok: true, verified: true } };
     });
-  } finally {
-    releaseSendLock(sendToken);
+
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err.code === "NOT_ON_WHATSAPP") {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("[WhatsApp] Send failed:", err.message);
+    return res.status(500).json({
+      error: err.message || "Failed to send on WhatsApp.",
+      needsReconnect: !state.ready,
+    });
+  }
+});
+
+app.post("/send-image", async (req, res) => {
+  try {
+    const result = await withSendLock(async () => {
+      if (!state.ready || !sock) {
+        return {
+          status: 503,
+          body: {
+            error: "WhatsApp not connected. Scan QR code in billing app.",
+            needsReconnect: true,
+          },
+        };
+      }
+
+      const { phone, message, imagePath } = req.body || {};
+      const digits = normalizePhone(phone);
+      if (digits.length < 11) {
+        return { status: 400, body: { error: "Invalid phone number." } };
+      }
+
+      const filePath = path.resolve(String(imagePath || ""));
+      if (!filePath || !fs.existsSync(filePath)) {
+        return { status: 400, body: { error: "Offer image file not found." } };
+      }
+
+      const jid = await resolveTargetJid(digits);
+      const imgBuffer = fs.readFileSync(filePath);
+      await withTimeout(
+        sock.sendMessage(jid, {
+          image: imgBuffer,
+          caption: String(message || ""),
+        }),
+        SEND_TIMEOUT_MS,
+        "Image send"
+      );
+
+      return { status: 200, body: { ok: true } };
+    });
+
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err.code === "NOT_ON_WHATSAPP") {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("[WhatsApp] Image send failed:", err.message);
+    return res.status(500).json({ error: err.message || "Failed to send image on WhatsApp." });
   }
 });
 
 app.post("/send-text", async (req, res) => {
-  let sendToken = await waitForSendLock();
-
-  if (!state.ready || !client) {
-    releaseSendLock(sendToken);
-    return res.status(503).json({
-      error: "WhatsApp not connected. Scan QR code in billing app.",
-      needsReconnect: true,
-    });
-  }
-
-  const { phone, message } = req.body || {};
-  const digits = normalizePhone(phone);
-  if (digits.length < 11) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Invalid phone number." });
-  }
-  if (!String(message || "").trim()) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Message is required." });
-  }
-
   try {
-    try {
-      await withSendTimeout(performSendText(digits, message), "text send");
-      return res.json({ ok: true });
-    } catch (err) {
-      if (err.code === "NOT_ON_WHATSAPP") {
-        return res.status(400).json({ error: err.message });
-      }
-
-      if (isSessionError(err)) {
-        console.error("[WhatsApp] Send-text session error:", err.message);
-        releaseSendLock(sendToken);
-        const reconnected = await softRecoverClient(err.message);
-        if (!reconnected) {
-          return res.status(503).json({
-            error: "WhatsApp send layer not ready. Open WhatsApp in the billing app, wait until Ready, then try again.",
+    const result = await withSendLock(async () => {
+      if (!state.ready || !sock) {
+        return {
+          status: 503,
+          body: {
+            error: "WhatsApp not connected. Scan QR code in billing app.",
             needsReconnect: true,
-          });
-        }
-        sendToken = await waitForSendLock();
-        try {
-          await withSendTimeout(performSendText(digits, message), "text send retry");
-          return res.json({ ok: true, recovered: true });
-        } finally {
-          releaseSendLock(sendToken);
-        }
+          },
+        };
       }
 
-      throw err;
-    }
-  } catch (err) {
-    console.error("[WhatsApp] Send-text failed:", err);
-    return res.status(500).json({ error: err.message || "Send failed." });
-  } finally {
-    releaseSendLock(sendToken);
-  }
-});
+      const { phone, message } = req.body || {};
+      const digits = normalizePhone(phone);
+      if (digits.length < 11) {
+        return { status: 400, body: { error: "Invalid phone number." } };
+      }
 
-app.post("/send", async (req, res) => {
-  const sendToken = await waitForSendLock();
+      const text = String(message || "").trim();
+      if (!text) {
+        return { status: 400, body: { error: "Message text is required." } };
+      }
 
-  if (!state.ready || !client) {
-    releaseSendLock(sendToken);
-    return res.status(503).json({
-      error: "WhatsApp not connected. Scan QR code in billing app.",
-      needsReconnect: true,
+      const jid = await resolveTargetJid(digits);
+      await withTimeout(
+        sock.sendMessage(jid, { text }),
+        SEND_TIMEOUT_MS,
+        "Text send"
+      );
+
+      return { status: 200, body: { ok: true } };
     });
-  }
 
-  const { phone, message, pdfPath, filename } = req.body || {};
-  const digits = normalizePhone(phone);
-  if (digits.length < 11) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Invalid phone number." });
-  }
-
-  const filePath = path.resolve(String(pdfPath || ""));
-  if (!filePath || !fs.existsSync(filePath)) {
-    releaseSendLock(sendToken);
-    return res.status(400).json({ error: "Invoice PDF file not found." });
-  }
-
-  try {
-    try {
-      await withSendTimeout(performSend(digits, message, filePath, filename), "bill send");
-      console.log(`[WhatsApp] Bill send verified for ${digits.slice(-10)}`);
-      return res.json({ ok: true, verified: true });
-    } catch (err) {
-      if (err.code === "NOT_ON_WHATSAPP") {
-        return res.status(400).json({ error: err.message });
-      }
-
-      if (isSessionError(err)) {
-        state.ready = false;
-        console.error("[WhatsApp] Send session error:", err.message);
-        const friendly = isCommsError(err)
-          ? "WhatsApp is still connecting — wait 10 seconds and tap Send again."
-          : isStoreError(err)
-            ? "WhatsApp is still loading — wait 10 seconds and try again."
-            : "WhatsApp session hiccup — wait 10 seconds and tap Send again.";
-        return res.status(503).json({
-          error: friendly,
-          needsReconnect: true,
-        });
-      }
-
-      if (isStoreError(err)) {
-        return res.status(503).json({
-          error:
-            "WhatsApp is still loading its chat system. Wait about 1 minute, then try Send on WhatsApp again.",
-          needsReconnect: true,
-        });
-      }
-
-      if (isCommsError(err)) {
-        return res.status(503).json({
-          error:
-            "WhatsApp is still connecting on the server. Wait about 1 minute, then try Send on WhatsApp again.",
-          needsReconnect: true,
-        });
-      }
-
-      if (err.code === "SEND_NOT_CONFIRMED") {
-        return res.status(503).json({
-          error: err.message,
-          needsReconnect: false,
-          retryAfterSec: 8,
-        });
-      }
-
-      if (isLidError(err) || isContactGetterError(err) || err.code === "CONTACT_GETTER") {
-        return res.status(500).json({
-          error:
-            err.message ||
-            "Could not send to this phone number on WhatsApp. Check the number is correct and registered on WhatsApp.",
-          needsReconnect: false,
-        });
-      }
-
-      throw err;
-    }
+    return res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("[WhatsApp] Send failed:", err);
-    return res.status(500).json({
-      error: err.message || "Failed to send on WhatsApp.",
-      needsReconnect: isSessionError(err),
-    });
-  } finally {
-    releaseSendLock(sendToken);
+    if (err.code === "NOT_ON_WHATSAPP") {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("[WhatsApp] Text send failed:", err.message);
+    return res.status(500).json({ error: err.message || "Failed to send message on WhatsApp." });
   }
 });
 
@@ -2149,26 +562,16 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   });
   process.on("exit", releaseSingleInstanceLock);
 
-  ensureAuthDirs();
-  state.phase = "booting";
-  console.log(`[WhatsApp] Bridge HTTP ready on http://127.0.0.1:${PORT}`);
-  console.log(`[WhatsApp] Session data: ${AUTH_DIR}`);
-  console.log(`[WhatsApp] WA Web version: ${WA_WEB_VERSION}`);
-  setImmediate(() => {
-    migrateLegacyAuthDir();
-    state.sessionLinked = hasSessionLinked();
-    initializeClient().catch((err) => {
-      state.phase = "error";
-      state.lastError = err.message;
-      console.error("[WhatsApp] Init failed:", err.message);
-    });
-  });
+  bridgeStartedAt = Date.now();
+  console.log(`[WhatsApp] Baileys bridge HTTP ready on http://127.0.0.1:${PORT}`);
+  void initializeClient({ fresh: false });
 });
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`[WhatsApp] Port ${PORT} is already in use. Close the other WhatsApp Scanner window, or run Reset WhatsApp.bat`);
-    process.exit(1);
+    console.error(`[WhatsApp] Port ${PORT} is already in use.`);
+  } else {
+    console.error("[WhatsApp] Server error:", err.message);
   }
-  throw err;
+  process.exit(1);
 });
